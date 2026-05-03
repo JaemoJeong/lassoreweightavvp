@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from avvp_stage12.baselines import compute_zero_shot_baseline
 
 
 ROOT = Path("/home/jaemo/AVVP_stage12_clean/results")
@@ -59,6 +63,16 @@ def load_av2a_baseline():
 
 
 AV2A_BASELINE = load_av2a_baseline()
+ZS_BASELINE = compute_zero_shot_baseline()
+(OUT_DIR / "zs_baseline.json").write_text(json.dumps(ZS_BASELINE, indent=2))
+
+
+def zs_key_for_panel(key: str) -> tuple[str, str] | None:
+    if key.startswith("f1_audio_"):
+        return "zs_clap_audio", "ZS-CLAP audio"
+    if key.startswith("f1_visual_"):
+        return "zs_clip_visual", "ZS-CLIP visual"
+    return None
 
 
 fig, axes = plt.subplots(2, 3, figsize=(16, 8.5), facecolor="white")
@@ -83,6 +97,17 @@ for ax, (_, key, title, ylabel) in zip(axes.flat, panels):
             linewidth=1.7,
             alpha=0.8,
             label=f"AV2A {AV2A_BASELINE['label']}",
+        )
+    zs_spec = zs_key_for_panel(key)
+    if zs_spec is not None:
+        zs_key, zs_label = zs_spec
+        ax.axhline(
+            ZS_BASELINE[zs_key],
+            color="#666666",
+            linestyle="-.",
+            linewidth=1.6,
+            alpha=0.8,
+            label=zs_label,
         )
     ax.set_xscale("log")
     ax.set_xlabel("λ_base")

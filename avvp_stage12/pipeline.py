@@ -146,35 +146,51 @@ def compute_sparse_confidence(stage1_weights: np.ndarray, eps: float = 1e-8) -> 
     return (stage1_weights / (top + eps)).astype(np.float32)
 
 
-def compute_local_support(
+def compute_reliable_sparse_confidence(
     stage1_weights: np.ndarray,
     recon_center: np.ndarray,
     eps: float = 1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     sparse_confidence = compute_sparse_confidence(stage1_weights, eps=eps)
-    # r_m(t) is a reconstruction reliability signal, so negative centered
-    # reconstruction cosine should not become a negative prior.
-    reliability = np.clip(recon_center, 0.0, 1.0).astype(np.float32)
-    local_support = (sparse_confidence * reliability[:, :, None]).astype(np.float32)
-    return sparse_confidence, reliability, local_support
+    # q_m(t) is reconstruction quality. We keep only positive evidence so a
+    # poor decomposition weakens the prior rather than becoming negative support.
+    reconstruction_quality = np.clip(recon_center, 0.0, 1.0).astype(np.float32)
+    reliable_confidence = (
+        sparse_confidence * reconstruction_quality[:, :, None]
+    ).astype(np.float32)
+    return sparse_confidence, reconstruction_quality, reliable_confidence
+
+
+def compute_local_support(
+    stage1_weights: np.ndarray,
+    recon_center: np.ndarray,
+    eps: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Backward-compatible alias for older callers.
+    return compute_reliable_sparse_confidence(stage1_weights, recon_center, eps=eps)
+
+
+def compute_video_prior(reliable_confidence: np.ndarray) -> np.ndarray:
+    return reliable_confidence.max(axis=1).astype(np.float32)
 
 
 def compute_video_plausibility(local_support: np.ndarray) -> np.ndarray:
-    return local_support.max(axis=1).astype(np.float32)
+    # Backward-compatible alias for older naming.
+    return compute_video_prior(local_support)
 
 
 def build_cross_modal_prior(
-    source_local_support: np.ndarray,
-    source_plausibility: np.ndarray,
+    source_segment_prior: np.ndarray,
+    source_video_prior: np.ndarray,
     kappa: float,
     prior_mode: str = "full",
 ) -> np.ndarray:
-    video_prior = source_plausibility[:, None, :]
+    video_prior = source_video_prior[:, None, :]
     if prior_mode == "video":
-        return np.broadcast_to(video_prior, source_local_support.shape).astype(np.float32)
+        return np.broadcast_to(video_prior, source_segment_prior.shape).astype(np.float32)
     if prior_mode != "full":
         raise ValueError(f"unknown prior_mode={prior_mode!r}; expected 'full' or 'video'")
-    return (video_prior * (1.0 + float(kappa) * source_local_support)).astype(np.float32)
+    return (video_prior * (1.0 + float(kappa) * source_segment_prior)).astype(np.float32)
 
 
 def build_prior_weighted_penalty(
@@ -265,26 +281,26 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
     if cfg.max_stage == 1:
         return results
 
-    sparse_conf_a, reliability_a, local_support_a = compute_local_support(
+    sparse_conf_a, quality_a, reliable_conf_a = compute_reliable_sparse_confidence(
         audio_stage1["weights"],
         audio_stage1["recon_center"],
     )
-    sparse_conf_v, reliability_v, local_support_v = compute_local_support(
+    sparse_conf_v, quality_v, reliable_conf_v = compute_reliable_sparse_confidence(
         visual_stage1["weights"],
         visual_stage1["recon_center"],
     )
-    plausibility_a = compute_video_plausibility(local_support_a)
-    plausibility_v = compute_video_plausibility(local_support_v)
+    video_prior_a = compute_video_prior(reliable_conf_a)
+    video_prior_v = compute_video_prior(reliable_conf_v)
 
     prior_v_to_a = build_cross_modal_prior(
-        source_local_support=local_support_v,
-        source_plausibility=plausibility_v,
+        source_segment_prior=reliable_conf_v,
+        source_video_prior=video_prior_v,
         kappa=cfg.kappa,
         prior_mode=cfg.prior_mode,
     )
     prior_a_to_v = build_cross_modal_prior(
-        source_local_support=local_support_a,
-        source_plausibility=plausibility_a,
+        source_segment_prior=reliable_conf_a,
+        source_video_prior=video_prior_a,
         kappa=cfg.kappa,
         prior_mode=cfg.prior_mode,
     )
@@ -309,9 +325,13 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
 
     results["audio"].update({
         "sparse_confidence": sparse_conf_a,
-        "reliability": reliability_a,
-        "local_support": local_support_a,
-        "plausibility": plausibility_a,
+        "reconstruction_quality": quality_a,
+        "reliable_confidence": reliable_conf_a,
+        "video_prior": video_prior_a,
+        # Backward-compatible aliases for previous experiment artifacts.
+        "reliability": quality_a,
+        "local_support": reliable_conf_a,
+        "plausibility": video_prior_a,
         "prior_from_visual": prior_v_to_a,
         "penalty_scale": penalty_scale_a,
         "evidence_from_visual": prior_v_to_a,
@@ -322,9 +342,13 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
     })
     results["visual"].update({
         "sparse_confidence": sparse_conf_v,
-        "reliability": reliability_v,
-        "local_support": local_support_v,
-        "plausibility": plausibility_v,
+        "reconstruction_quality": quality_v,
+        "reliable_confidence": reliable_conf_v,
+        "video_prior": video_prior_v,
+        # Backward-compatible aliases for previous experiment artifacts.
+        "reliability": quality_v,
+        "local_support": reliable_conf_v,
+        "plausibility": video_prior_v,
         "prior_from_audio": prior_a_to_v,
         "penalty_scale": penalty_scale_v,
         "evidence_from_audio": prior_a_to_v,

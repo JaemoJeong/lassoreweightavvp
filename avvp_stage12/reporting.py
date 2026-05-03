@@ -39,11 +39,28 @@ def _binary_f1_per_class(pred: np.ndarray, gt: np.ndarray) -> list[dict[str, flo
     return out
 
 
+def _top_indices(scores: np.ndarray, top_k: int, eps: float = 1e-8) -> list[int]:
+    if top_k <= 0 or float(np.max(scores)) <= eps:
+        return []
+    return np.argsort(scores)[::-1][:top_k].tolist()
+
+
 def _top_labels(scores: np.ndarray, top_k: int) -> str:
     if top_k <= 0:
         return ""
-    idx = np.argsort(scores)[::-1][:top_k]
+    idx = _top_indices(scores, top_k)
+    if not idx:
+        return "(all zero)"
     return ", ".join(f"{LLP_CATS[i]}:{scores[i]:.3f}" for i in idx)
+
+
+def _underline(text: str) -> str:
+    out = []
+    for ch in text:
+        out.append(ch)
+        if ch != " ":
+            out.append("̲")
+    return "".join(out)
 
 
 def compute_stage_predictions(
@@ -160,14 +177,22 @@ def write_segment_details(
             if top_k > 0:
                 lines.append(f"    topA: {top_a}")
                 lines.append(f"    topV: {top_v}")
-            lines.append("  " + "-" * 128)
-            lines.append(
-                "  "
-                + f"{'Category':<28} | GT_A GT_V GT_AV | Pred_A Pred_V Pred_AV | "
-                + f"A_Score V_Score | A_W V_W"
-                + ("" if not extra_columns else " | " + " ".join(f"{name:>10}" for name, _ in extra_columns))
+            header = (
+                f"{'Category':<28} | "
+                + f"{'GT_A':>4} {'GT_V':>4} {'GT_AV':>5} | "
+                + f"{'Pred_A':>6} {'Pred_V':>6} {'Pred_AV':>7} | "
+                + f"{'A_Score':>7} {'V_Score':>7} | "
+                + f"{'A_W':>7} {'V_W':>7}"
+                + (
+                    ""
+                    if not extra_columns
+                    else " | " + " ".join(f"{name:>10}" for name, _ in extra_columns)
+                )
             )
-            lines.append("  " + "-" * 128)
+            sep_line = "-" * len(header)
+            lines.append("  " + sep_line)
+            lines.append("  " + header)
+            lines.append("  " + sep_line)
 
             active = (
                 gt_a[vid_idx, seg_idx]
@@ -178,8 +203,8 @@ def write_segment_details(
                 | pred_av[vid_idx, seg_idx]
             ).astype(bool)
             if top_k > 0:
-                top_idx = set(np.argsort(scores_a[vid_idx, seg_idx])[::-1][:top_k].tolist())
-                top_idx.update(np.argsort(scores_v[vid_idx, seg_idx])[::-1][:top_k].tolist())
+                top_idx = set(_top_indices(scores_a[vid_idx, seg_idx], top_k))
+                top_idx.update(_top_indices(scores_v[vid_idx, seg_idx], top_k))
             else:
                 top_idx = set()
             show_idx = list(range(len(LLP_CATS))) if all_classes else [
@@ -189,28 +214,40 @@ def write_segment_details(
             if not show_idx:
                 lines.append("  (no active GT/pred classes)")
             for class_idx in show_idx:
+                ga = int(gt_a[vid_idx, seg_idx, class_idx])
+                gv = int(gt_v[vid_idx, seg_idx, class_idx])
+                a_score_s = f"{scores_a[vid_idx, seg_idx, class_idx]:>7.3f}"
+                v_score_s = f"{scores_v[vid_idx, seg_idx, class_idx]:>7.3f}"
+                a_w_s = f"{W_a[vid_idx, seg_idx, class_idx]:>7.4f}"
+                v_w_s = f"{W_v[vid_idx, seg_idx, class_idx]:>7.4f}"
+                if ga:
+                    a_score_s = _underline(a_score_s)
+                    a_w_s = _underline(a_w_s)
+                if gv:
+                    v_score_s = _underline(v_score_s)
+                    v_w_s = _underline(v_w_s)
+                extra_str = ""
+                if extra_columns:
+                    parts = []
+                    for name, values in extra_columns:
+                        cell = f"{values[vid_idx, seg_idx, class_idx]:>10.4f}"
+                        prefix = name[:2]
+                        if (prefix == "A_" and ga) or (prefix == "V_" and gv):
+                            cell = _underline(cell)
+                        parts.append(cell)
+                    extra_str = " | " + " ".join(parts)
                 lines.append(
                     "  "
                     + f"{LLP_CATS[class_idx]:<28} | "
-                    + f"  {int(gt_a[vid_idx, seg_idx, class_idx])}    "
-                    + f"{int(gt_v[vid_idx, seg_idx, class_idx])}     "
-                    + f"{int(gt_av[vid_idx, seg_idx, class_idx])}   | "
-                    + f"   {int(pred_a[vid_idx, seg_idx, class_idx])}      "
-                    + f"{int(pred_v[vid_idx, seg_idx, class_idx])}       "
-                    + f"{int(pred_av[vid_idx, seg_idx, class_idx])}    | "
-                    + f" {scores_a[vid_idx, seg_idx, class_idx]:.3f}   "
-                    + f"{scores_v[vid_idx, seg_idx, class_idx]:.3f} | "
-                    + f"{W_a[vid_idx, seg_idx, class_idx]:.4f} "
-                    + f"{W_v[vid_idx, seg_idx, class_idx]:.4f}"
-                    + (
-                        ""
-                        if not extra_columns
-                        else " | "
-                        + " ".join(
-                            f"{values[vid_idx, seg_idx, class_idx]:10.4f}"
-                            for _, values in extra_columns
-                        )
-                    )
+                    + f"{ga:>4} "
+                    + f"{gv:>4} "
+                    + f"{int(gt_av[vid_idx, seg_idx, class_idx]):>5} | "
+                    + f"{int(pred_a[vid_idx, seg_idx, class_idx]):>6} "
+                    + f"{int(pred_v[vid_idx, seg_idx, class_idx]):>6} "
+                    + f"{int(pred_av[vid_idx, seg_idx, class_idx]):>7} | "
+                    + f"{a_score_s} {v_score_s} | "
+                    + f"{a_w_s} {v_w_s}"
+                    + extra_str
                 )
             lines.append("")
 

@@ -153,6 +153,13 @@ def main() -> None:
     if "stage2" in audio_results:
         np.save(args.out_dir / "sparse_confidence_a.npy", audio_results["sparse_confidence"])
         np.save(args.out_dir / "sparse_confidence_v.npy", visual_results["sparse_confidence"])
+        np.save(args.out_dir / "reconstruction_quality_a.npy", audio_results["reconstruction_quality"])
+        np.save(args.out_dir / "reconstruction_quality_v.npy", visual_results["reconstruction_quality"])
+        np.save(args.out_dir / "reliable_confidence_a.npy", audio_results["reliable_confidence"])
+        np.save(args.out_dir / "reliable_confidence_v.npy", visual_results["reliable_confidence"])
+        np.save(args.out_dir / "video_prior_a.npy", audio_results["video_prior"])
+        np.save(args.out_dir / "video_prior_v.npy", visual_results["video_prior"])
+        # Backward-compatible aliases used by earlier notes/scripts.
         np.save(args.out_dir / "reliability_a.npy", audio_results["reliability"])
         np.save(args.out_dir / "reliability_v.npy", visual_results["reliability"])
         np.save(args.out_dir / "local_support_a.npy", audio_results["local_support"])
@@ -280,11 +287,13 @@ def main() -> None:
         "notes": {
             "presence": "P[c] = max_t w_stage1[t, c]",
             "sparse_confidence": "s_m(t,c)=w_m(t,c)/(max_j w_m(t,j)+eps)",
-            "reliability": "r_m(t)=max(0, cos(z_tilde_m(t), normalize(C_tilde_m w_m(t))))",
-            "local_support": "h_m(t,c)=s_m(t,c)*r_m(t)",
-            "plausibility": "pi_m(c)=max_t h_m(t,c)",
+            "reconstruction_quality": "q_m(t)=max(0, cos(z_tilde_m(t), normalize(C_tilde_m w_m(t))))",
+            "reliable_confidence": "g_m(t,c)=s_m(t,c)*q_m(t)",
+            "segment_prior": "h_m(t,c)=g_m(t,c)",
+            "video_prior": "pi_m(c)=max_t g_m(t,c)",
+            "legacy_names": "reliability=q, local_support/reliable_confidence=g, plausibility/video_prior=pi",
             "cross_modal_prior": (
-                "full: H_source_to_target(t,c)=pi_source(c)*(1+kappa*h_source(t,c)); "
+                "full: H_source_to_target(t,c)=pi_source(c)*(1+kappa*g_source(t,c)); "
                 "video: H_source_to_target(t,c)=pi_source(c)"
             ),
             "stage2_prior_mode": results["config"]["prior_mode"],

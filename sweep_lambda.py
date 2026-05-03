@@ -42,7 +42,8 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from avvp_stage12.data import build_dense_gt, load_llp_metadata, parse_video_id
+from avvp_stage12.baselines import compute_zero_shot_baseline
+from avvp_stage12.data import build_dense_gt, load_llp_metadata
 from avvp_stage12.metrics import (
     norm_similarities_np,
     avvp_segment_f1,
@@ -225,7 +226,27 @@ def _draw_av2a_baselines(ax, baseline: dict[str, object] | None) -> None:
         ax.axhline(float(value), color=color, linestyle=":", linewidth=1.6, alpha=0.8, label=label)
 
 
-def make_plots(records: list[dict], out_root: Path, sanity: dict | None, av2a_baseline: dict[str, object] | None) -> None:
+def _draw_zs_baselines(ax, baseline: dict[str, object] | None) -> None:
+    if baseline is None:
+        return
+    specs = [
+        ("zs_clap_audio", "#1f77b4", "ZS-CLAP audio"),
+        ("zs_clip_visual", "#2ca02c", "ZS-CLIP visual"),
+    ]
+    for key, color, label in specs:
+        value = baseline.get(key)
+        if value is None:
+            continue
+        ax.axhline(float(value), color=color, linestyle="-.", linewidth=1.5, alpha=0.75, label=label)
+
+
+def make_plots(
+    records: list[dict],
+    out_root: Path,
+    sanity: dict | None,
+    av2a_baseline: dict[str, object] | None,
+    zs_baseline: dict[str, object] | None,
+) -> None:
     records_main = sorted([r for r in records if r["is_main"]], key=lambda r: r["lambda"])
     lams = [r["lambda"] for r in records_main]
 
@@ -238,6 +259,7 @@ def make_plots(records: list[dict], out_root: Path, sanity: dict | None, av2a_ba
     ax.plot(lams, [r["f1_visual_stage1"] for r in records_main], "-s", color="#2ca02c", label="Visual · stage1")
     ax.plot(lams, [r["f1_visual_stage2"] for r in records_main], "--s", color="#2ca02c", label="Visual · stage2")
     _draw_av2a_baselines(ax, av2a_baseline)
+    _draw_zs_baselines(ax, zs_baseline)
     ax.set_xscale("log")
     ax.set_xlabel("λ_base")
     ax.set_ylabel(f"AVVP segment F1 (fixed thr={THR})")
@@ -283,6 +305,12 @@ def make_plots(records: list[dict], out_root: Path, sanity: dict | None, av2a_ba
     )
     if av2a_baseline is not None:
         title += f"\nAV2A baseline: {Path(str(av2a_baseline['path'])).parent.name}"
+    if zs_baseline is not None:
+        title += (
+            f"\nZS baseline: CLAP-audio={float(zs_baseline['zs_clap_audio']):.4f}, "
+            f"CLIP-visual={float(zs_baseline['zs_clip_visual']):.4f}, "
+            f"AV={float(zs_baseline['zs_av_and']):.4f}"
+        )
     if sanity is not None:
         title += (f"\nSanity (η=0, λ={sanity['lambda']}): "
                   f"max|W₂−W₁| audio={sanity['max_abs_W_diff_audio']:.2e}, "
@@ -322,6 +350,7 @@ def main() -> None:
     ap.add_argument("--visual-mean-path", type=str, default=None)
     ap.add_argument("--av2a-metrics-path", type=str, default=str(DEFAULT_AV2A_METRICS_PATH))
     ap.add_argument("--no-av2a-baseline", action="store_true")
+    ap.add_argument("--no-zs-baseline", action="store_true")
     ap.add_argument(
         "--score-include-zero",
         action="store_true",
@@ -387,18 +416,24 @@ def main() -> None:
               f"recon_a1={ev['recon_audio_stage1']:.3f} recon_v1={ev['recon_visual_stage1']:.3f}  "
               f"L0_a1={ev['l0_audio_stage1']:.2f} L0_v1={ev['l0_visual_stage1']:.2f}")
 
-    sanity_ev = evaluate_run(sanity_dir, filenames, score_exclude_zero=score_exclude_zero)
-    sanity_ev.update({"lambda": args.sanity_lambda, "kappa": args.kappa, "eta": 0.0,
-                       "rho_min": args.rho_min, "rho_max": args.rho_max,
-                       "stage2_prior_mode": args.stage2_prior_mode,
-                       "is_main": False, "out_dir": str(sanity_dir),
-                       "mean_source": args.mean_source,
-                       "mean_source_label": label})
-    records.append(sanity_ev)
-    print(f"[sanity η=0, λ={args.sanity_lambda}]  "
-          f"F1 a1={sanity_ev['f1_audio_stage1']:.4f} a2={sanity_ev['f1_audio_stage2']:.4f}  "
-          f"v1={sanity_ev['f1_visual_stage1']:.4f} v2={sanity_ev['f1_visual_stage2']:.4f}  "
-          f"max|W₂−W₁| a={sanity_ev['max_abs_W_diff_audio']:.2e} v={sanity_ev['max_abs_W_diff_visual']:.2e}")
+    sanity_ev = None
+    if (sanity_dir / "meta.json").exists():
+        sanity_ev = evaluate_run(sanity_dir, filenames, score_exclude_zero=score_exclude_zero)
+        sanity_ev.update({"lambda": args.sanity_lambda, "kappa": args.kappa, "eta": 0.0,
+                           "rho_min": args.rho_min, "rho_max": args.rho_max,
+                           "stage2_prior_mode": args.stage2_prior_mode,
+                           "is_main": False, "out_dir": str(sanity_dir),
+                           "mean_source": args.mean_source,
+                           "mean_source_label": label})
+        records.append(sanity_ev)
+        print(f"[sanity η=0, λ={args.sanity_lambda}]  "
+              f"F1 a1={sanity_ev['f1_audio_stage1']:.4f} a2={sanity_ev['f1_audio_stage2']:.4f}  "
+              f"v1={sanity_ev['f1_visual_stage1']:.4f} v2={sanity_ev['f1_visual_stage2']:.4f}  "
+              f"max|W₂−W₁| a={sanity_ev['max_abs_W_diff_audio']:.2e} v={sanity_ev['max_abs_W_diff_visual']:.2e}")
+    elif args.skip_run:
+        print(f"[warn] sanity run missing under {sanity_dir}; plotting without sanity annotation")
+    else:
+        raise FileNotFoundError(f"sanity run missing under {sanity_dir}")
 
     (args.out_root / "sweep_results.json").write_text(json.dumps(records, indent=2))
     print(f"[json] saved → {args.out_root / 'sweep_results.json'}")
@@ -417,7 +452,22 @@ def main() -> None:
             f"av={_fmt_metric('av')} "
             f"from {av2a_baseline.get('path')}"
         )
-    make_plots(records, args.out_root, sanity_ev, av2a_baseline)
+    zs_baseline = None
+    if not args.no_zs_baseline:
+        kept_filenames = json.loads((Path(records[0]["out_dir"]) / "meta.json").read_text())["filenames"]
+        zs_baseline = compute_zero_shot_baseline(
+            filenames=kept_filenames,
+            threshold=THR,
+        )
+        (args.out_root / "zs_baseline.json").write_text(json.dumps(zs_baseline, indent=2))
+        print(
+            "[zs] "
+            f"CLAP-audio={float(zs_baseline['zs_clap_audio']):.4f} "
+            f"CLIP-visual={float(zs_baseline['zs_clip_visual']):.4f} "
+            f"AV={float(zs_baseline['zs_av_and']):.4f} "
+            f"(N={zs_baseline['num_videos']}, thr={zs_baseline['threshold']})"
+        )
+    make_plots(records, args.out_root, sanity_ev, av2a_baseline, zs_baseline)
 
 
 if __name__ == "__main__":

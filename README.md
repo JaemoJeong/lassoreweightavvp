@@ -7,7 +7,7 @@ hint-weighted sparse decomposition을 깔끔하게 다시 구현한 버전이다
 
 현재 범위:
 - stage1: modality별 centered non-negative Lasso decomposition
-- stage2: reliability-weighted local support `h(t,c)` 와 video-level plausibility `pi(c)` 로 cross-modal prior `H(t,c)` 구성
+- stage2: reliability-weighted sparse confidence `g(t,c)` 에서 segment prior `h(t,c)` 와 video prior `pi(c)` 를 대칭적으로 구성
 - stage3: `lambda_c(t) = lambda_base * clip(exp(-eta * H(t,c)), rho_min, rho_max)` 로 weighted Lasso 재실행
 - stage4: fixed-threshold AVVP scoring + detail report
 
@@ -63,14 +63,17 @@ cached global feature shape / legacy comparison을 위해 bundle에는 유지한
 ## Weighted hint
 
 v5 main formulation은 explicit absence term을 쓰지 않는다.
-상대 modality의 stage1 sparse interpretation에서 다음 prior를 만든다.
+먼저 각 segment-class pair에 대해 reliability-weighted sparse confidence를 정의한다.
+Segment-level local support와 video-level prior는 모두 이 동일한 confidence에서 파생되며,
+차이는 temporal scope뿐이다.
 
 ```python
 s_m[t, c] = w_m[t, c] / (max_j w_m[t, j] + eps)
-r_m[t] = max(0, cos(z_tilde_m[t], normalize(C_tilde_m @ w_m[t])))
-h_m[t, c] = s_m[t, c] * r_m[t]
-pi_m[c] = max_t h_m[t, c]
-H_source_to_target[t, c] = pi_source[c] * (1 + kappa * h_source[t, c])
+q_m[t] = max(0, cos(z_tilde_m[t], normalize(C_tilde_m @ w_m[t])))
+g_m[t, c] = s_m[t, c] * q_m[t]
+h_m[t, c] = g_m[t, c]
+pi_m[c] = max_t g_m[t, c]
+H_source_to_target[t, c] = pi_source[c] * (1 + kappa * g_source[t, c])
 lambda_target[t, c] = lambda_base * clip(exp(-eta * H_source_to_target[t, c]), rho_min, rho_max)
 ```
 
@@ -131,12 +134,19 @@ FSD50K train mean을 새로 만들 때는 아래 두 스크립트를 쓴다.
 다른 `main.py` 결과를 쓰려면 `--av2a-metrics-path /path/to/per_class_metrics.json`,
 baseline 없이 보려면 `--no-av2a-baseline` 을 붙인다.
 사용한 baseline 값은 sweep output 아래 `av2a_baseline.json` 으로도 저장된다.
+또한 cached segment feature와 v25 prompt prototype으로 zero-shot CLAP/CLIP baseline을 재계산해서
+F1 plot에 dash-dot horizontal line으로 추가한다.
+규칙은 `raw cosine -> per-segment class-axis z-score -> sigmoid -> fixed threshold 0.75` 이며,
+값은 `zs_baseline.json` 으로 저장된다. 끄려면 `--no-zs-baseline` 을 붙인다.
 
 주요 저장물:
 - `W_a_stage1.npy`, `W_v_stage1.npy`
 - `recon_center_a_stage1.npy`, `recon_center_v_stage1.npy`
 - `P_a.npy`, `P_v.npy`
 - `sparse_confidence_a.npy`, `sparse_confidence_v.npy`
+- `reconstruction_quality_a.npy`, `reconstruction_quality_v.npy`
+- `reliable_confidence_a.npy`, `reliable_confidence_v.npy`
+- `video_prior_a.npy`, `video_prior_v.npy`
 - `reliability_a.npy`, `reliability_v.npy`
 - `local_support_a.npy`, `local_support_v.npy`
 - `plausibility_a.npy`, `plausibility_v.npy`
