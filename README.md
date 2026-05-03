@@ -9,7 +9,7 @@ hint-weighted sparse decomposition을 깔끔하게 다시 구현한 버전이다
 - stage1: modality별 centered non-negative Lasso decomposition
 - stage2: reliability-weighted sparse confidence `g(t,c)` 에서 segment prior `h(t,c)` 와 video prior `pi(c)` 를 대칭적으로 구성
 - stage3: `lambda_c(t) = lambda_base * clip(exp(-eta * H(t,c)), rho_min, rho_max)` 로 weighted Lasso 재실행
-- stage4: fixed-threshold AVVP scoring + detail report
+- stage4: v5.2 sparsity-aware fixed-threshold AVVP scoring + detail report
 
 이번 구현에서 의도적으로 제외한 것:
 - explicit absence / active rejection main path
@@ -80,6 +80,31 @@ lambda_target[t, c] = lambda_base * clip(exp(-eta * H_source_to_target[t, c]), r
 audio reweight에는 visual evidence를, visual reweight에는 audio evidence를 넣는다.
 `--stage2-prior-mode video` 또는 `--video-prior-only` 를 쓰면
 segment/local prior 항을 끄고 `H_source_to_target[t,c] = pi_source[c]` 만 적용한다.
+
+## v5.2 prediction protocol
+
+Stage1과 Stage2는 같은 scoring 함수를 사용한다.
+
+```python
+W -> active z-score over nonzero coefficients
+K = ||W||_0
+T = clip(K / K0, Tmin, Tmax)
+p = sigmoid(z / T)
+y = 1[p > tau]
+```
+
+기본값:
+- `tau = 0.75`
+- `K0 = 16`
+- `Tmin = 0.25`
+- `Tmax = 1.25`
+- exact-zero weights are rejected candidates and excluded from z-score statistics
+
+구현 위치:
+- common scorer: `avvp_stage12.metrics.score_sparse_weights`
+- runner/reporting: `run_llp_stage12.py`, `avvp_stage12.reporting`
+- table candidates: `scripts/build_main_table_candidates.py`
+- sensitivity evaluator: `scripts/evaluate_active_count_temperature.py`
 
 ## Runner
 
@@ -159,7 +184,7 @@ F1 plot에 dash-dot horizontal line으로 추가한다.
 가시화 / 평가 저장물:
 - `metrics.json`: stage별 F1 요약
 - `metrics_stage1.json`, `metrics_stage2.json`: per-class precision/recall/F1 포함 상세 지표
-- `scores_preds_stage1.npz`, `scores_preds_stage2.npz`: `sigmoid(z-score(W over class axis))` scores, binary pred, GT
+- `scores_preds_stage1.npz`, `scores_preds_stage2.npz`: v5.2 scores, binary pred, `K`, `T`, GT
 - `segment_details_stage1.txt`, `segment_details_stage2.txt`: video/segment/class별 GT, pred, score, raw W
 
 Stage cutoff / detail 옵션:
@@ -182,6 +207,8 @@ Stage cutoff / detail 옵션:
 - `--eta`: cross-modal prior strength. 기본 `1.0`; `0`이면 stage1로 환원
 - `--rho-min`, `--rho-max`: selection cost clipping bound. 기본 `0.1`, `1.0`
 - `--stage2-prior-mode full|video`: 기본 `full` 은 `video-level prior * segment prior`; `video` 는 video-level prior만 사용
+- `--score-mode adaptive_k|fixed_t`: 기본 `adaptive_k` 는 v5.2 `T=clip(K/K0,Tmin,Tmax)`, `fixed_t` 는 같은 active z-score에서 `T=1`
+- `--score-k0`, `--score-t-min`, `--score-t-max`: 기본 `16`, `0.25`, `1.25`
 - score normalization 기본값은 `W=0` class를 mean/std 계산에서 제외한다. 이전 방식처럼 zero까지 포함하려면 `--score-include-zero`를 붙인다.
 - `--no-details`: 큰 `segment_details_*.txt` 생성을 끔. sweep에서는 이 옵션을 자동으로 사용한다.
 - `--detail-max-videos N`: detail txt를 앞 N개 video만 저장. `0`이면 전체 저장
@@ -191,4 +218,4 @@ Stage cutoff / detail 옵션:
 
 - solver는 batched GPU FISTA 기본값을 쓴다. objective는 draft의 non-negative Lasso와 동일하다.
 - weighted stage는 sklearn column-rescale 대신, 같은 objective를 직접 푸는 weighted proximal update로 구현했다.
-- later experiment에서 threshold / recon-aware scoring을 붙일 수 있도록 helper는 `avvp_stage12/metrics.py` 에 분리해뒀다.
+- v5.2부터 sparse prediction helper는 `avvp_stage12/metrics.py` 의 `score_sparse_weights` 로 고정한다.

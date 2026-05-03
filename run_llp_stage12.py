@@ -8,8 +8,8 @@ import numpy as np
 
 from avvp_stage12.constants import DEFAULT_BACKBONE, DEFAULT_MEAN_SOURCE, DEFAULT_VOCAB
 from avvp_stage12.data import build_dense_gt, load_llp_cached_bundle, load_prompt_vocab, load_reference_means
-from avvp_stage12.metrics import norm_similarities_np
 from avvp_stage12.pipeline import Stage12Config, prepare_modality, run_stage12
+from avvp_stage12.reporting import compute_stage_predictions
 from avvp_stage12.reporting import write_stage_eval_outputs
 
 
@@ -52,6 +52,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-mean-path", type=Path, default=None)
     parser.add_argument("--visual-mean-path", type=Path, default=None)
     parser.add_argument("--score-thr", type=float, default=0.75)
+    parser.add_argument(
+        "--score-mode",
+        choices=["adaptive_k", "fixed_t"],
+        default="adaptive_k",
+        help="v5.2 default is adaptive_k: active z-score + T=clip(K/K0,Tmin,Tmax)",
+    )
+    parser.add_argument("--score-k0", type=float, default=16.0)
+    parser.add_argument("--score-t-min", type=float, default=0.25)
+    parser.add_argument("--score-t-max", type=float, default=1.25)
     parser.add_argument(
         "--score-include-zero",
         action="store_true",
@@ -189,8 +198,15 @@ def main() -> None:
     score_exclude_zero = not args.score_include_zero
     metrics = {
         "threshold": float(args.score_thr),
-        "score_normalization": "per segment, over class axis: sigmoid((W - mean(W_class)) / std(W_class))",
+        "score_normalization": (
+            "adaptive_k: active z-score over nonzero coefficients, "
+            "T=clip(K/K0,Tmin,Tmax), sigmoid(z/T); fixed_t: same active z-score, T=1"
+        ),
+        "score_mode": args.score_mode,
         "score_exclude_zero": bool(score_exclude_zero),
+        "score_k0": float(args.score_k0),
+        "score_t_min": float(args.score_t_min),
+        "score_t_max": float(args.score_t_max),
         "pred_av_rule": "Pred_AV = Pred_A AND Pred_V",
         "stages": {},
     }
@@ -209,14 +225,24 @@ def main() -> None:
         detail_max_videos=int(args.detail_max_videos),
         detail_top_k=int(args.detail_top_k),
         detail_all_classes=bool(args.detail_all_classes),
+        score_mode=args.score_mode,
+        score_k0=float(args.score_k0),
+        score_t_min=float(args.score_t_min),
+        score_t_max=float(args.score_t_max),
     )
     if "stage2" in audio_results:
-        stage1_scores_a = norm_similarities_np(
-            audio_results["stage1"]["weights"], exclude_zero=score_exclude_zero
-        ).astype(np.float32)
-        stage1_scores_v = norm_similarities_np(
-            visual_results["stage1"]["weights"], exclude_zero=score_exclude_zero
-        ).astype(np.float32)
+        stage1_pred = compute_stage_predictions(
+            audio_results["stage1"]["weights"],
+            visual_results["stage1"]["weights"],
+            threshold=float(args.score_thr),
+            score_exclude_zero=score_exclude_zero,
+            score_mode=args.score_mode,
+            score_k0=float(args.score_k0),
+            score_t_min=float(args.score_t_min),
+            score_t_max=float(args.score_t_max),
+        )
+        stage1_scores_a = stage1_pred["scores_a"].astype(np.float32)
+        stage1_scores_v = stage1_pred["scores_v"].astype(np.float32)
         video_prior_v_to_a = broadcast_video_prior(visual_results["plausibility"], audio.num_segments)
         video_prior_a_to_v = broadcast_video_prior(audio_results["plausibility"], visual.num_segments)
         metrics["stages"]["stage2"] = write_stage_eval_outputs(
@@ -234,6 +260,10 @@ def main() -> None:
             detail_max_videos=int(args.detail_max_videos),
             detail_top_k=int(args.detail_top_k),
             detail_all_classes=bool(args.detail_all_classes),
+            score_mode=args.score_mode,
+            score_k0=float(args.score_k0),
+            score_t_min=float(args.score_t_min),
+            score_t_max=float(args.score_t_max),
             detail_extra_columns=[
                 ("A_S1Score", stage1_scores_a),
                 ("V_S1Score", stage1_scores_v),
@@ -298,7 +328,14 @@ def main() -> None:
             ),
             "stage2_prior_mode": results["config"]["prior_mode"],
             "weighted_lambda": "lambda_target^c(t)=lambda_base*clip(exp(-eta*H_source_to_target(t,c)), rho_min, rho_max)",
-            "score": "sigmoid(z-score(W over class axis))",
+            "score": (
+                "adaptive_k: active z-score over nonzero coefficients, "
+                "T=clip(K/K0,Tmin,Tmax), sigmoid(z/T); fixed_t: active z-score with T=1"
+            ),
+            "score_mode": args.score_mode,
+            "score_k0": float(args.score_k0),
+            "score_t_min": float(args.score_t_min),
+            "score_t_max": float(args.score_t_max),
             "score_exclude_zero": bool(score_exclude_zero),
             "prediction_threshold": float(args.score_thr),
             "pred_av": "Pred_A AND Pred_V",
