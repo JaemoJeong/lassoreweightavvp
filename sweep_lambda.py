@@ -1,0 +1,286 @@
+"""
+λ sweep driver + evaluator + plotter for the clean stage1/2 pipeline.
+
+This script does NOT modify any code under avvp_stage12/. It only:
+  1. Calls run_llp_stage12.py as a subprocess for each (β, γ, λ) combination.
+  2. Loads the saved W_*_stage{1,2}.npy + meta.json from each run.
+  3. Builds dense GT via avvp_stage12.data.build_dense_gt.
+  4. Computes a fixed-threshold AVVP segment F1 using avvp_stage12.metrics helpers,
+     uniformly across all (λ, modality, stage).
+  5. Writes a single-file plot summary (PNG + PDF + sweep_results.json).
+
+Convention:
+  W (n, 10, K) → norm_similarities_np (label-axis z-score + sigmoid)
+              → > THR (default 0.75) → binary pred (n, 10, K)
+              → avvp_segment_f1 against dense GT (n, 10, K)
+              → mean over n*10 segments (clip-segment macro-style F1)
+
+Sanity sweep (β=γ=0):
+  Stage 2 should be (essentially) identical to Stage 1 because the weighted
+  penalty collapses to (1 - 0) * λ_base = λ_base everywhere.
+  We log max-abs(W_stage2 - W_stage1) and the F1 delta to confirm.
+
+NOTE on transductive scope (per agreement):
+  • centering mean is computed on LLP test features (test-feature mean,
+    label-free, transductive). Recorded in meta_transductive.json.
+  • norm_similarities mean/std is per-sample over the class axis,
+    not transductive (no leakage).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Add parent so we can `import avvp_stage12.*` from this script (read-only access)
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+
+from avvp_stage12.data import build_dense_gt, load_llp_metadata, parse_video_id
+from avvp_stage12.metrics import (
+    norm_similarities_np,
+    avvp_segment_f1,
+)
+from avvp_stage12.constants import LLP_CATS
+
+THR = 0.75
+RUNNER = ROOT / "run_llp_stage12.py"
+PYBIN = "/home/jaemo/miniconda3/envs/av2a_fresh/bin/python"
+
+
+def lam_tag(lam: float) -> str:
+    return f"lam{('%.4f' % lam).rstrip('0').rstrip('.').replace('.', 'p')}"
+
+
+def run_one(out_dir: Path, lam: float, beta: float, gamma: float,
+            lam_min_factor: float, fista_iters: int, device: str,
+            limit_videos: int, dry_run: bool) -> None:
+    cmd = [
+        PYBIN, str(RUNNER),
+        "--out-dir", str(out_dir),
+        "--lambda-base", str(lam),
+        "--beta", str(beta),
+        "--gamma", str(gamma),
+        "--lambda-min-factor", str(lam_min_factor),
+        "--fista-iters", str(fista_iters),
+        "--device", device,
+    ]
+    if limit_videos > 0:
+        cmd += ["--limit-videos", str(limit_videos)]
+    print("[run]", " ".join(cmd[2:]))
+    if dry_run:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_file = out_dir / "run.log"
+    with log_file.open("w") as lf:
+        proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"run failed for {out_dir} (see {log_file})")
+
+
+def fixed_threshold_pred(weights: np.ndarray, thr: float = THR) -> np.ndarray:
+    """W: (n, 10, K) → binary pred (n, 10, K) via label-axis norm + threshold."""
+    probs = norm_similarities_np(weights)  # axis=-1 over K
+    return (probs > thr).astype(np.uint8)
+
+
+def f1_from_W(W: np.ndarray, GT: np.ndarray) -> float:
+    """Flatten (n, 10, K) → (n*10, K) for avvp_segment_f1 (per-row macro-style)."""
+    pred = fixed_threshold_pred(W).reshape(-1, W.shape[-1])
+    gt = GT.reshape(-1, GT.shape[-1])
+    return avvp_segment_f1(pred, gt)
+
+
+def evaluate_run(out_dir: Path, filenames: list[str]) -> dict[str, float]:
+    """Load saved npy + GT, compute fixed-thr F1 + read recon/L0 from meta."""
+    meta = json.loads((out_dir / "meta.json").read_text())
+    Wa1 = np.load(out_dir / "W_a_stage1.npy")
+    Wv1 = np.load(out_dir / "W_v_stage1.npy")
+    Wa2 = np.load(out_dir / "W_a_stage2.npy")
+    Wv2 = np.load(out_dir / "W_v_stage2.npy")
+
+    GT_A = build_dense_gt(filenames, "audio")
+    GT_V = build_dense_gt(filenames, "visual")
+    if GT_A.shape[0] != Wa1.shape[0]:
+        # bundle keeps only valid videos; rebuild GT for kept filenames
+        kept = meta["filenames"]
+        GT_A = build_dense_gt(kept, "audio")
+        GT_V = build_dense_gt(kept, "visual")
+
+    f1_a1 = f1_from_W(Wa1, GT_A)
+    f1_a2 = f1_from_W(Wa2, GT_A)
+    f1_v1 = f1_from_W(Wv1, GT_V)
+    f1_v2 = f1_from_W(Wv2, GT_V)
+
+    # Sanity diagnostics: stage1 vs stage2 W max-abs diff (only meaningful at β=γ=0)
+    diff_a = float(np.max(np.abs(Wa2 - Wa1)))
+    diff_v = float(np.max(np.abs(Wv2 - Wv1)))
+
+    return {
+        "f1_audio_stage1": f1_a1,
+        "f1_audio_stage2": f1_a2,
+        "f1_visual_stage1": f1_v1,
+        "f1_visual_stage2": f1_v2,
+        "recon_audio_stage1": meta["audio_summary_stage1"]["recon_mean"],
+        "recon_audio_stage2": meta["audio_summary_stage2"]["recon_mean"],
+        "recon_visual_stage1": meta["visual_summary_stage1"]["recon_mean"],
+        "recon_visual_stage2": meta["visual_summary_stage2"]["recon_mean"],
+        "l0_audio_stage1": meta["audio_summary_stage1"]["l0_mean"],
+        "l0_audio_stage2": meta["audio_summary_stage2"]["l0_mean"],
+        "l0_visual_stage1": meta["visual_summary_stage1"]["l0_mean"],
+        "l0_visual_stage2": meta["visual_summary_stage2"]["l0_mean"],
+        "max_abs_W_diff_audio": diff_a,
+        "max_abs_W_diff_visual": diff_v,
+    }
+
+
+def write_transductive_meta(out_root: Path) -> None:
+    info = {
+        "mean_source": "llp_test_dataset",
+        "segment_mean_scope": "all valid LLP test segments (per modality, post L2-norm)",
+        "video_mean_scope": "all valid LLP test videos (per modality, post L2-norm)",
+        "scope_label": "test-feature mean / transductive / label-free",
+        "purpose": "exploratory λ sweep — not for final claim",
+    }
+    (out_root / "meta_transductive.json").write_text(json.dumps(info, indent=2))
+
+
+def make_plots(records: list[dict], out_root: Path, sanity: dict | None) -> None:
+    records_main = sorted([r for r in records if r["is_main"]], key=lambda r: r["lambda"])
+    lams = [r["lambda"] for r in records_main]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), facecolor="white")
+
+    # --- F1 plot
+    ax = axes[0]
+    ax.plot(lams, [r["f1_audio_stage1"] for r in records_main], "-o", color="#1f77b4", label="Audio · stage1")
+    ax.plot(lams, [r["f1_audio_stage2"] for r in records_main], "--o", color="#1f77b4", label="Audio · stage2")
+    ax.plot(lams, [r["f1_visual_stage1"] for r in records_main], "-s", color="#2ca02c", label="Visual · stage1")
+    ax.plot(lams, [r["f1_visual_stage2"] for r in records_main], "--s", color="#2ca02c", label="Visual · stage2")
+    ax.set_xscale("log")
+    ax.set_xlabel("λ_base")
+    ax.set_ylabel(f"AVVP segment F1 (fixed thr={THR})")
+    ax.set_title(f"F1 vs λ   (β=γ={records_main[0]['beta']:.1f}, fixed thr {THR})", fontsize=11)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8.5)
+
+    # --- recon plot
+    ax = axes[1]
+    ax.plot(lams, [r["recon_audio_stage1"] for r in records_main], "-o", color="#1f77b4", label="Audio · stage1")
+    ax.plot(lams, [r["recon_audio_stage2"] for r in records_main], "--o", color="#1f77b4", label="Audio · stage2")
+    ax.plot(lams, [r["recon_visual_stage1"] for r in records_main], "-s", color="#2ca02c", label="Visual · stage1")
+    ax.plot(lams, [r["recon_visual_stage2"] for r in records_main], "--s", color="#2ca02c", label="Visual · stage2")
+    ax.set_xscale("log")
+    ax.set_xlabel("λ_base")
+    ax.set_ylabel("centered recon cosine")
+    ax.set_title("recon vs λ   (centered space, paper §3.2.4 def)", fontsize=11)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8.5)
+
+    # --- L0 plot
+    ax = axes[2]
+    ax.plot(lams, [r["l0_audio_stage1"] for r in records_main], "-o", color="#1f77b4", label="Audio · stage1")
+    ax.plot(lams, [r["l0_audio_stage2"] for r in records_main], "--o", color="#1f77b4", label="Audio · stage2")
+    ax.plot(lams, [r["l0_visual_stage1"] for r in records_main], "-s", color="#2ca02c", label="Visual · stage1")
+    ax.plot(lams, [r["l0_visual_stage2"] for r in records_main], "--s", color="#2ca02c", label="Visual · stage2")
+    ax.set_xscale("log")
+    ax.set_xlabel("λ_base")
+    ax.set_ylabel("L0 (mean #nonzero per segment)")
+    ax.set_title("L0 vs λ", fontsize=11)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8.5)
+
+    title = "stage1/2 λ sweep · LLP test (test-feature mean, transductive)"
+    if sanity is not None:
+        title += (f"\nSanity (β=γ=0, λ={sanity['lambda']}): "
+                  f"max|W₂−W₁| audio={sanity['max_abs_W_diff_audio']:.2e}, "
+                  f"visual={sanity['max_abs_W_diff_visual']:.2e}  ·  "
+                  f"F1 audio Δ={sanity['f1_audio_stage2']-sanity['f1_audio_stage1']:+.4f}, "
+                  f"visual Δ={sanity['f1_visual_stage2']-sanity['f1_visual_stage1']:+.4f}")
+    fig.suptitle(title, fontsize=10.5, y=1.02)
+
+    out_png = out_root / "sweep_lambda.png"
+    out_pdf = out_root / "sweep_lambda.pdf"
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    fig.savefig(out_pdf, bbox_inches="tight")
+    print(f"[plot] saved → {out_png}")
+    print(f"[plot] saved → {out_pdf}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out-root", type=Path, default=ROOT / "results" / "sweep_lambda")
+    ap.add_argument("--lambdas", type=float, nargs="+",
+                    default=[0.005, 0.01, 0.02, 0.05, 0.1, 0.2])
+    ap.add_argument("--beta", type=float, default=0.5)
+    ap.add_argument("--gamma", type=float, default=0.5)
+    ap.add_argument("--lambda-min-factor", type=float, default=0.1)
+    ap.add_argument("--fista-iters", type=int, default=200)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--limit-videos", type=int, default=0)
+    ap.add_argument("--sanity-lambda", type=float, default=0.05,
+                    help="run an extra (β=γ=0, λ=this) sanity to confirm stage1≈stage2")
+    ap.add_argument("--skip-run", action="store_true",
+                    help="skip subprocess execution, only re-evaluate from existing dirs")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print commands without executing or evaluating")
+    args = ap.parse_args()
+
+    args.out_root.mkdir(parents=True, exist_ok=True)
+    write_transductive_meta(args.out_root)
+
+    # ---------- 1. run all configs ----------
+    main_dirs = []
+    for lam in args.lambdas:
+        d = args.out_root / lam_tag(lam)
+        main_dirs.append((lam, d))
+        if not args.skip_run:
+            run_one(d, lam, args.beta, args.gamma, args.lambda_min_factor,
+                    args.fista_iters, args.device, args.limit_videos, args.dry_run)
+
+    sanity_dir = args.out_root / f"sanity_b0g0_{lam_tag(args.sanity_lambda)}"
+    if not args.skip_run:
+        run_one(sanity_dir, args.sanity_lambda, 0.0, 0.0, args.lambda_min_factor,
+                args.fista_iters, args.device, args.limit_videos, args.dry_run)
+
+    if args.dry_run:
+        print("[dry-run] done; no eval / no plot.")
+        return
+
+    # ---------- 2. evaluate ----------
+    df = load_llp_metadata()
+    filenames = df.filename.tolist()
+
+    records = []
+    for lam, d in main_dirs:
+        ev = evaluate_run(d, filenames)
+        ev.update({"lambda": lam, "beta": args.beta, "gamma": args.gamma, "is_main": True, "out_dir": str(d)})
+        records.append(ev)
+        print(f"[eval] λ={lam}  F1 a1={ev['f1_audio_stage1']:.4f} a2={ev['f1_audio_stage2']:.4f}  "
+              f"v1={ev['f1_visual_stage1']:.4f} v2={ev['f1_visual_stage2']:.4f}  "
+              f"recon_a1={ev['recon_audio_stage1']:.3f} recon_v1={ev['recon_visual_stage1']:.3f}  "
+              f"L0_a1={ev['l0_audio_stage1']:.2f} L0_v1={ev['l0_visual_stage1']:.2f}")
+
+    sanity_ev = evaluate_run(sanity_dir, filenames)
+    sanity_ev.update({"lambda": args.sanity_lambda, "beta": 0.0, "gamma": 0.0,
+                       "is_main": False, "out_dir": str(sanity_dir)})
+    records.append(sanity_ev)
+    print(f"[sanity β=γ=0, λ={args.sanity_lambda}]  "
+          f"F1 a1={sanity_ev['f1_audio_stage1']:.4f} a2={sanity_ev['f1_audio_stage2']:.4f}  "
+          f"v1={sanity_ev['f1_visual_stage1']:.4f} v2={sanity_ev['f1_visual_stage2']:.4f}  "
+          f"max|W₂−W₁| a={sanity_ev['max_abs_W_diff_audio']:.2e} v={sanity_ev['max_abs_W_diff_visual']:.2e}")
+
+    (args.out_root / "sweep_results.json").write_text(json.dumps(records, indent=2))
+    print(f"[json] saved → {args.out_root / 'sweep_results.json'}")
+
+    # ---------- 3. plot ----------
+    make_plots(records, args.out_root, sanity_ev)
+
+
+if __name__ == "__main__":
+    main()
