@@ -47,15 +47,22 @@ class PreparedModality:
     d_dim: int
 
 
-def prepare_modality(name: str, segment_raw: np.ndarray, video_raw: np.ndarray, proto_raw: np.ndarray) -> PreparedModality:
+def prepare_modality(
+    name: str,
+    segment_raw: np.ndarray,
+    video_raw: np.ndarray,
+    proto_raw: np.ndarray,
+    segment_mean_override: np.ndarray | None = None,
+    video_mean_override: np.ndarray | None = None,
+) -> PreparedModality:
     num_videos, num_segments, d_dim = segment_raw.shape
     if video_raw.shape != (num_videos, d_dim):
         raise ValueError(
             f"{name}: expected video shape {(num_videos, d_dim)}, got {video_raw.shape}"
         )
     segment_flat = segment_raw.reshape(-1, d_dim)
-    segment_n, segment_center, segment_mean = center_rows(segment_flat)
-    video_n, video_center, video_mean = center_rows(video_raw)
+    segment_n, segment_center, segment_mean = center_rows(segment_flat, mean_vec=segment_mean_override)
+    video_n, video_center, video_mean = center_rows(video_raw, mean_vec=video_mean_override)
     proto_n, proto_center, proto_mean = prepare_dictionary(proto_raw)
     return PreparedModality(
         name=name,

@@ -10,12 +10,16 @@ import torch
 from .constants import (
     CACHE_ROOT,
     DATA_ROOT,
+    DEFAULT_AUDIO_MEAN_FILE,
     DEFAULT_BACKBONE,
+    DEFAULT_MEAN_SOURCE,
+    DEFAULT_VISUAL_MEAN_FILE,
     DEFAULT_VOCAB,
     EVAL_AUDIO_CSV,
     EVAL_VISUAL_CSV,
     LLP_CATS,
     LLP_IDX,
+    MEANS_ROOT,
     TEST_CSV,
     VOCAB_ROOT,
 )
@@ -118,6 +122,28 @@ def load_prompt_vocab(vocab: str = DEFAULT_VOCAB) -> dict[str, object]:
         "meta": meta,
         "audio_rows": audio,
         "visual_rows": visual,
+    }
+
+
+def load_reference_means(
+    mean_source: str = DEFAULT_MEAN_SOURCE,
+    audio_mean_path: Path | None = None,
+    visual_mean_path: Path | None = None,
+) -> dict[str, np.ndarray] | None:
+    if mean_source == "llp":
+        return None
+    if mean_source != "external":
+        raise ValueError(f"unknown mean_source: {mean_source}")
+
+    audio_path = audio_mean_path or (MEANS_ROOT / DEFAULT_AUDIO_MEAN_FILE)
+    visual_path = visual_mean_path or (MEANS_ROOT / DEFAULT_VISUAL_MEAN_FILE)
+    audio_mean = np.load(audio_path).astype(np.float32).reshape(-1)
+    visual_mean = np.load(visual_path).astype(np.float32).reshape(-1)
+    return {
+        "audio": audio_mean,
+        "visual": visual_mean,
+        "audio_path": str(audio_path),
+        "visual_path": str(visual_path),
     }
 
 

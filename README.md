@@ -53,6 +53,12 @@ C_tilde = normalize(C_n - mean(C_n))
 여기서 `mu_seg` 와 `mu_video` 는 modality별 dataset mean 이다.
 video-level centering mean 은 segment mean 과 따로 계산한다.
 
+실험용으로 `run_llp_stage12.py` 는 mean source를 둘 다 지원한다.
+- `--mean-source llp`: LLP test feature mean
+- `--mean-source external`: precomputed backbone reference mean
+  - visual default: `/mnt/hdd4tb/jaemo/AVVP_vocab_sweep/means/clip_ViT-L-14_image_mscoco_train_N118287.npy`
+  - audio default: `/mnt/hdd4tb/jaemo/AVVP_vocab_sweep/means/clap_HTSAT-tiny_audio_dcase2017train_N1632.npy`
+
 ## Weighted hint
 
 이번 버전은 confidence 없이 아래 두 항만 쓴다.
@@ -72,6 +78,16 @@ audio reweight에는 visual evidence를, visual reweight에는 audio evidence를
 /home/jaemo/miniconda3/envs/av2a_fresh/bin/python \
   /home/jaemo/AVVP_stage12_clean/run_llp_stage12.py \
   --out-dir /home/jaemo/AVVP_stage12_clean/results/default \
+  --device cuda
+```
+
+LLP mean vs reference mean 비교용 sweep 예시:
+
+```bash
+/home/jaemo/miniconda3/envs/av2a_fresh/bin/python \
+  /home/jaemo/AVVP_stage12_clean/sweep_lambda.py \
+  --out-root /home/jaemo/AVVP_stage12_clean/results/sweep_lambda_extmean \
+  --mean-source external \
   --device cuda
 ```
 

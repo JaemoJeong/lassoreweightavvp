@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from avvp_stage12.constants import DEFAULT_BACKBONE, DEFAULT_VOCAB
-from avvp_stage12.data import load_llp_cached_bundle, load_prompt_vocab
+from avvp_stage12.constants import DEFAULT_BACKBONE, DEFAULT_MEAN_SOURCE, DEFAULT_VOCAB
+from avvp_stage12.data import load_llp_cached_bundle, load_prompt_vocab, load_reference_means
 from avvp_stage12.pipeline import Stage12Config, prepare_modality, run_stage12
 
 
@@ -29,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fista-iters", type=int, default=200)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--limit-videos", type=int, default=0)
+    parser.add_argument("--mean-source", choices=["llp", "external"], default=DEFAULT_MEAN_SOURCE)
+    parser.add_argument("--audio-mean-path", type=Path, default=None)
+    parser.add_argument("--visual-mean-path", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -48,6 +51,11 @@ def main() -> None:
 
     bundle = load_llp_cached_bundle(backbone=args.backbone)
     vocab = load_prompt_vocab(args.vocab)
+    means = load_reference_means(
+        mean_source=args.mean_source,
+        audio_mean_path=args.audio_mean_path,
+        visual_mean_path=args.visual_mean_path,
+    )
 
     limit = args.limit_videos if args.limit_videos > 0 else len(bundle["filenames"])
     filenames = bundle["filenames"][:limit]
@@ -62,12 +70,16 @@ def main() -> None:
         segment_raw=audio_segments,
         video_raw=audio_video,
         proto_raw=vocab["audio_rows"],
+        segment_mean_override=None if means is None else means["audio"],
+        video_mean_override=None if means is None else means["audio"],
     )
     visual = prepare_modality(
         "visual",
         segment_raw=visual_segments,
         video_raw=visual_video,
         proto_raw=vocab["visual_rows"],
+        segment_mean_override=None if means is None else means["visual"],
+        video_mean_override=None if means is None else means["visual"],
     )
 
     cfg = Stage12Config(
@@ -115,6 +127,13 @@ def main() -> None:
         "filenames": filenames,
         "video_ids": video_ids,
         "config": results["config"],
+        "mean_source": args.mean_source,
+        "mean_info": {
+            "audio_path": None if means is None else means["audio_path"],
+            "visual_path": None if means is None else means["visual_path"],
+            "audio_dim": int(audio.segment_mean.shape[0]),
+            "visual_dim": int(visual.segment_mean.shape[0]),
+        },
         "audio_summary_stage1": results["audio"]["summary_stage1"],
         "audio_summary_stage2": results["audio"]["summary_stage2"],
         "audio_summary_video": results["audio"]["summary_video"],

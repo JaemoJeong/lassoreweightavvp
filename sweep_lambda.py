@@ -59,6 +59,7 @@ def lam_tag(lam: float) -> str:
 
 def run_one(out_dir: Path, lam: float, beta: float, gamma: float,
             lam_min_factor: float, fista_iters: int, device: str,
+            mean_source: str, audio_mean_path: str | None, visual_mean_path: str | None,
             limit_videos: int, dry_run: bool) -> None:
     cmd = [
         PYBIN, str(RUNNER),
@@ -69,7 +70,12 @@ def run_one(out_dir: Path, lam: float, beta: float, gamma: float,
         "--lambda-min-factor", str(lam_min_factor),
         "--fista-iters", str(fista_iters),
         "--device", device,
+        "--mean-source", mean_source,
     ]
+    if audio_mean_path:
+        cmd += ["--audio-mean-path", audio_mean_path]
+    if visual_mean_path:
+        cmd += ["--visual-mean-path", visual_mean_path]
     if limit_videos > 0:
         cmd += ["--limit-videos", str(limit_videos)]
     print("[run]", " ".join(cmd[2:]))
@@ -139,15 +145,26 @@ def evaluate_run(out_dir: Path, filenames: list[str]) -> dict[str, float]:
     }
 
 
-def write_transductive_meta(out_root: Path) -> None:
-    info = {
-        "mean_source": "llp_test_dataset",
-        "segment_mean_scope": "all valid LLP test segments (per modality, post L2-norm)",
-        "video_mean_scope": "all valid LLP test videos (per modality, post L2-norm)",
-        "scope_label": "test-feature mean / transductive / label-free",
-        "purpose": "exploratory λ sweep — not for final claim",
-    }
-    (out_root / "meta_transductive.json").write_text(json.dumps(info, indent=2))
+def write_mean_meta(out_root: Path, mean_source: str, audio_mean_path: str | None, visual_mean_path: str | None) -> None:
+    if mean_source == "llp":
+        info = {
+            "mean_source": "llp_test_dataset",
+            "segment_mean_scope": "all valid LLP test segments (per modality, post L2-norm)",
+            "video_mean_scope": "all valid LLP test videos (per modality, post L2-norm)",
+            "scope_label": "test-feature mean / transductive / label-free",
+            "purpose": "exploratory λ sweep — compare against external reference means",
+        }
+        out_name = "meta_transductive.json"
+    else:
+        info = {
+            "mean_source": "external_reference",
+            "audio_mean_path": audio_mean_path,
+            "visual_mean_path": visual_mean_path,
+            "scope_label": "backbone reference mean / non-LLP",
+            "purpose": "mean-source comparison against LLP test-feature mean",
+        }
+        out_name = "meta_reference.json"
+    (out_root / out_name).write_text(json.dumps(info, indent=2))
 
 
 def make_plots(records: list[dict], out_root: Path, sanity: dict | None) -> None:
@@ -195,7 +212,7 @@ def make_plots(records: list[dict], out_root: Path, sanity: dict | None) -> None
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8.5)
 
-    title = "stage1/2 λ sweep · LLP test (test-feature mean, transductive)"
+    title = f"stage1/2 λ sweep · LLP test ({records_main[0]['mean_source_label']})"
     if sanity is not None:
         title += (f"\nSanity (β=γ=0, λ={sanity['lambda']}): "
                   f"max|W₂−W₁| audio={sanity['max_abs_W_diff_audio']:.2e}, "
@@ -223,6 +240,9 @@ def main() -> None:
     ap.add_argument("--fista-iters", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit-videos", type=int, default=0)
+    ap.add_argument("--mean-source", choices=["llp", "external"], default="llp")
+    ap.add_argument("--audio-mean-path", type=str, default=None)
+    ap.add_argument("--visual-mean-path", type=str, default=None)
     ap.add_argument("--sanity-lambda", type=float, default=0.05,
                     help="run an extra (β=γ=0, λ=this) sanity to confirm stage1≈stage2")
     ap.add_argument("--skip-run", action="store_true",
@@ -232,7 +252,7 @@ def main() -> None:
     args = ap.parse_args()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
-    write_transductive_meta(args.out_root)
+    write_mean_meta(args.out_root, args.mean_source, args.audio_mean_path, args.visual_mean_path)
 
     # ---------- 1. run all configs ----------
     main_dirs = []
@@ -241,12 +261,16 @@ def main() -> None:
         main_dirs.append((lam, d))
         if not args.skip_run:
             run_one(d, lam, args.beta, args.gamma, args.lambda_min_factor,
-                    args.fista_iters, args.device, args.limit_videos, args.dry_run)
+                    args.fista_iters, args.device, args.mean_source,
+                    args.audio_mean_path, args.visual_mean_path,
+                    args.limit_videos, args.dry_run)
 
     sanity_dir = args.out_root / f"sanity_b0g0_{lam_tag(args.sanity_lambda)}"
     if not args.skip_run:
         run_one(sanity_dir, args.sanity_lambda, 0.0, 0.0, args.lambda_min_factor,
-                args.fista_iters, args.device, args.limit_videos, args.dry_run)
+                args.fista_iters, args.device, args.mean_source,
+                args.audio_mean_path, args.visual_mean_path,
+                args.limit_videos, args.dry_run)
 
     if args.dry_run:
         print("[dry-run] done; no eval / no plot.")
@@ -259,7 +283,15 @@ def main() -> None:
     records = []
     for lam, d in main_dirs:
         ev = evaluate_run(d, filenames)
-        ev.update({"lambda": lam, "beta": args.beta, "gamma": args.gamma, "is_main": True, "out_dir": str(d)})
+        ev.update({
+            "lambda": lam,
+            "beta": args.beta,
+            "gamma": args.gamma,
+            "is_main": True,
+            "out_dir": str(d),
+            "mean_source": args.mean_source,
+            "mean_source_label": "test-feature mean, transductive" if args.mean_source == "llp" else "MSCOCO/DCASE reference mean",
+        })
         records.append(ev)
         print(f"[eval] λ={lam}  F1 a1={ev['f1_audio_stage1']:.4f} a2={ev['f1_audio_stage2']:.4f}  "
               f"v1={ev['f1_visual_stage1']:.4f} v2={ev['f1_visual_stage2']:.4f}  "
@@ -268,7 +300,9 @@ def main() -> None:
 
     sanity_ev = evaluate_run(sanity_dir, filenames)
     sanity_ev.update({"lambda": args.sanity_lambda, "beta": 0.0, "gamma": 0.0,
-                       "is_main": False, "out_dir": str(sanity_dir)})
+                       "is_main": False, "out_dir": str(sanity_dir),
+                       "mean_source": args.mean_source,
+                       "mean_source_label": "test-feature mean, transductive" if args.mean_source == "llp" else "MSCOCO/DCASE reference mean"})
     records.append(sanity_ev)
     print(f"[sanity β=γ=0, λ={args.sanity_lambda}]  "
           f"F1 a1={sanity_ev['f1_audio_stage1']:.4f} a2={sanity_ev['f1_audio_stage2']:.4f}  "
