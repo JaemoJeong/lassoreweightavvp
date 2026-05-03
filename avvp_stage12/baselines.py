@@ -7,7 +7,7 @@ import numpy as np
 
 from .constants import DEFAULT_BACKBONE, DEFAULT_VOCAB
 from .data import build_dense_gt, load_llp_cached_bundle, load_prompt_vocab
-from .metrics import avvp_segment_f1, norm_similarities_np
+from .metrics import avvp_official_metrics, avvp_segment_f1, norm_similarities_np
 
 
 DEFAULT_AV2A_METRICS_PATH = Path(
@@ -31,7 +31,7 @@ def load_av2a_baseline(metrics_path: str | Path | None = DEFAULT_AV2A_METRICS_PA
         return None
     data = json.loads(path.read_text())
     overall = data.get("overall", data)
-    return {
+    baseline = {
         "path": str(path),
         "audio": _as_fraction(overall.get("F_seg_a") or overall.get("audio_segment_f1")),
         "visual": _as_fraction(overall.get("F_seg_v") or overall.get("visual_segment_f1")),
@@ -41,6 +41,36 @@ def load_av2a_baseline(metrics_path: str | Path | None = DEFAULT_AV2A_METRICS_PA
             or overall.get("av_segment_f1_and")
         ),
     }
+    for key in [
+        "F_seg_a",
+        "F_seg_v",
+        "F_seg",
+        "F_seg_av",
+        "avg_type",
+        "avg_event",
+        "F_event_a",
+        "F_event_v",
+        "F_event",
+        "F_event_av",
+        "avg_type_event",
+        "avg_event_level",
+    ]:
+        if key in overall:
+            baseline[key] = _as_fraction(overall[key])
+    if "F_seg_a" in baseline:
+        baseline.update({
+            "audio_segment_f1": baseline.get("F_seg_a"),
+            "audio_event_f1": baseline.get("F_event_a"),
+            "visual_segment_f1": baseline.get("F_seg_v"),
+            "visual_event_f1": baseline.get("F_event_v"),
+            "audio_visual_segment_f1": baseline.get("F_seg_av"),
+            "audio_visual_event_f1": baseline.get("F_event_av"),
+            "type_av_segment_f1": baseline.get("avg_type"),
+            "type_av_event_f1": baseline.get("avg_type_event"),
+            "event_av_segment_f1": baseline.get("avg_event"),
+            "event_av_event_f1": baseline.get("avg_event_level"),
+        })
+    return baseline
 
 
 def _l2_normalize(x: np.ndarray, axis: int = -1, eps: float = 1e-8) -> np.ndarray:
@@ -98,6 +128,7 @@ def compute_zero_shot_baseline(
     gt_a = build_dense_gt(kept_filenames, "audio")
     gt_v = build_dense_gt(kept_filenames, "visual")
     gt_av = (gt_a & gt_v).astype(np.uint8)
+    official = avvp_official_metrics(pred_a, pred_v, gt_a, gt_v, pred_av=pred_av, gt_av=gt_av)
 
     return {
         "backbone": backbone,
@@ -109,6 +140,29 @@ def compute_zero_shot_baseline(
         "zs_clap_audio": avvp_segment_f1(pred_a.reshape(-1, pred_a.shape[-1]), gt_a.reshape(-1, gt_a.shape[-1])),
         "zs_clip_visual": avvp_segment_f1(pred_v.reshape(-1, pred_v.shape[-1]), gt_v.reshape(-1, gt_v.shape[-1])),
         "zs_av_and": avvp_segment_f1(pred_av.reshape(-1, pred_av.shape[-1]), gt_av.reshape(-1, gt_av.shape[-1])),
+        "official_avvp": official,
+        "F_seg_a": official["F_seg_a"],
+        "F_seg_v": official["F_seg_v"],
+        "F_seg": official["F_seg"],
+        "F_seg_av": official["F_seg_av"],
+        "avg_type": official["avg_type"],
+        "avg_event": official["avg_event"],
+        "F_event_a": official["F_event_a"],
+        "F_event_v": official["F_event_v"],
+        "F_event": official["F_event"],
+        "F_event_av": official["F_event_av"],
+        "avg_type_event": official["avg_type_event"],
+        "avg_event_level": official["avg_event_level"],
+        "audio_segment_f1": official["audio_segment_f1"],
+        "audio_event_f1": official["audio_event_f1"],
+        "visual_segment_f1": official["visual_segment_f1"],
+        "visual_event_f1": official["visual_event_f1"],
+        "audio_visual_segment_f1": official["audio_visual_segment_f1"],
+        "audio_visual_event_f1": official["audio_visual_event_f1"],
+        "type_av_segment_f1": official["type_av_segment_f1"],
+        "type_av_event_f1": official["type_av_event_f1"],
+        "event_av_segment_f1": official["event_av_segment_f1"],
+        "event_av_event_f1": official["event_av_event_f1"],
         "audio_pred_active_mean": float(pred_a.sum(axis=-1).mean()),
         "visual_pred_active_mean": float(pred_v.sum(axis=-1).mean()),
         "av_pred_active_mean": float(pred_av.sum(axis=-1).mean()),

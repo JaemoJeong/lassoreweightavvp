@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .constants import LLP_CATS
-from .metrics import avvp_segment_f1, score_sparse_weights, sparse_weight_scores
+from .metrics import avvp_official_metrics, avvp_segment_f1, score_sparse_weights, sparse_weight_scores
 
 
 def _binary_f1_per_class(pred: np.ndarray, gt: np.ndarray) -> list[dict[str, float | int | str]]:
@@ -127,6 +127,7 @@ def compute_stage_metrics(
     pred_a = pred["pred_a"]
     pred_v = pred["pred_v"]
     pred_av = pred["pred_av"]
+    official = avvp_official_metrics(pred_a, pred_v, gt_a, gt_v, pred_av=pred_av, gt_av=gt_av)
     metrics = {
         "stage": stage_name,
         "threshold": float(threshold),
@@ -142,6 +143,29 @@ def compute_stage_metrics(
         "audio_segment_f1": avvp_segment_f1(pred_a.reshape(-1, pred_a.shape[-1]), gt_a.reshape(-1, gt_a.shape[-1])),
         "visual_segment_f1": avvp_segment_f1(pred_v.reshape(-1, pred_v.shape[-1]), gt_v.reshape(-1, gt_v.shape[-1])),
         "av_segment_f1_and": avvp_segment_f1(pred_av.reshape(-1, pred_av.shape[-1]), gt_av.reshape(-1, gt_av.shape[-1])),
+        "official_avvp": official,
+        "F_seg_a": official["F_seg_a"],
+        "F_seg_v": official["F_seg_v"],
+        "F_seg": official["F_seg"],
+        "F_seg_av": official["F_seg_av"],
+        "avg_type": official["avg_type"],
+        "avg_event": official["avg_event"],
+        "F_event_a": official["F_event_a"],
+        "F_event_v": official["F_event_v"],
+        "F_event": official["F_event"],
+        "F_event_av": official["F_event_av"],
+        "avg_type_event": official["avg_type_event"],
+        "avg_event_level": official["avg_event_level"],
+        "table_audio_segment": official["audio_segment_f1"],
+        "table_audio_event": official["audio_event_f1"],
+        "table_visual_segment": official["visual_segment_f1"],
+        "table_visual_event": official["visual_event_f1"],
+        "table_audio_visual_segment": official["audio_visual_segment_f1"],
+        "table_audio_visual_event": official["audio_visual_event_f1"],
+        "table_type_av_segment": official["type_av_segment_f1"],
+        "table_type_av_event": official["type_av_event_f1"],
+        "table_event_av_segment": official["event_av_segment_f1"],
+        "table_event_av_event": official["event_av_event_f1"],
         "audio_pred_active_mean": float(pred_a.sum(axis=-1).mean()),
         "visual_pred_active_mean": float(pred_v.sum(axis=-1).mean()),
         "av_pred_active_mean": float(pred_av.sum(axis=-1).mean()),

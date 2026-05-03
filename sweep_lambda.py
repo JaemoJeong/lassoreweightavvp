@@ -47,10 +47,14 @@ from avvp_stage12.data import build_dense_gt, load_llp_metadata
 from avvp_stage12.metrics import (
     norm_similarities_np,
     avvp_segment_f1,
+    score_sparse_weights,
 )
 from avvp_stage12.constants import LLP_CATS
 
 THR = 0.75
+SCORE_K0 = 16.0
+SCORE_T_MIN = 0.25
+SCORE_T_MAX = 1.25
 RUNNER = ROOT / "run_llp_stage12.py"
 PYBIN = "/home/jaemo/miniconda3/envs/av2a_fresh/bin/python"
 DEFAULT_AV2A_METRICS_PATH = Path(
@@ -100,9 +104,16 @@ def run_one(out_dir: Path, lam: float, kappa: float, eta: float,
 
 
 def fixed_threshold_pred(weights: np.ndarray, thr: float = THR, exclude_zero: bool = True) -> np.ndarray:
-    """W: (n, 10, K) → binary pred (n, 10, K) via label-axis norm + threshold."""
-    probs = norm_similarities_np(weights, exclude_zero=exclude_zero)  # axis=-1 over K
-    return (probs > thr).astype(np.uint8)
+    """W: (n, 10, K) → binary pred (n, 10, K) via v5.2 adaptive_k scorer."""
+    _, pred, _, _ = score_sparse_weights(
+        weights,
+        tau=thr,
+        k0=SCORE_K0,
+        t_min=SCORE_T_MIN,
+        t_max=SCORE_T_MAX,
+        exclude_zero=exclude_zero,
+    )
+    return pred
 
 
 def f1_from_W(W: np.ndarray, GT: np.ndarray, exclude_zero: bool = True) -> float:

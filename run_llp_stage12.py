@@ -308,6 +308,7 @@ def main() -> None:
                 "audio_segment_f1": vals["audio_segment_f1"],
                 "visual_segment_f1": vals["visual_segment_f1"],
                 "av_segment_f1_and": vals["av_segment_f1_and"],
+                "official_avvp": vals["official_avvp"],
                 "audio_pred_active_mean": vals["audio_pred_active_mean"],
                 "visual_pred_active_mean": vals["visual_pred_active_mean"],
                 "av_pred_active_mean": vals["av_pred_active_mean"],
