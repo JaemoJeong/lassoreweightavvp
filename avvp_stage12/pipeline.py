@@ -9,6 +9,7 @@ from .solver import (
     centered_reconstruction_cosine,
     nonnegative_lasso_fista,
     prepare_dictionary,
+    step4_reconstruction_cosine,
 )
 
 
@@ -96,7 +97,11 @@ def run_segment_decomposition(modality: PreparedModality, lam: float, iters: int
         n_iter=iters,
         device=device,
     )
-    recon_flat = centered_reconstruction_cosine(weights_flat, modality.segment_center, modality.proto_center)
+    # SpLiCE Step-4 recon cos: cos(ẑ, z_n) where ẑ = σ(σ(C̃·w) + μ_z)
+    z_n_flat = modality.segment_n.reshape(-1, modality.d_dim)
+    recon_flat = step4_reconstruction_cosine(
+        weights_flat, z_n_flat, modality.proto_center, modality.segment_mean
+    )
     return _segment_stats(weights_flat, recon_flat, modality.num_videos, modality.num_segments)
 
 
@@ -108,7 +113,9 @@ def run_video_decomposition(modality: PreparedModality, lam: float, iters: int, 
         n_iter=iters,
         device=device,
     )
-    recon = centered_reconstruction_cosine(weights, modality.video_center, modality.proto_center)
+    recon = step4_reconstruction_cosine(
+        weights, modality.video_n, modality.proto_center, modality.video_mean
+    )
     l0 = (weights > 1e-6).sum(axis=1).astype(np.float32)
     return {
         "weights": weights,
@@ -158,7 +165,10 @@ def run_weighted_segment_decomposition(
         n_iter=iters,
         device=device,
     )
-    recon_flat = centered_reconstruction_cosine(weights_flat, modality.segment_center, modality.proto_center)
+    z_n_flat = modality.segment_n.reshape(-1, modality.d_dim)
+    recon_flat = step4_reconstruction_cosine(
+        weights_flat, z_n_flat, modality.proto_center, modality.segment_mean
+    )
     return _segment_stats(weights_flat, recon_flat, modality.num_videos, modality.num_segments)
 
 

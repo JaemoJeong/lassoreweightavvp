@@ -177,8 +177,8 @@ def make_plots(records: list[dict], out_root: Path, sanity: dict | None) -> None
     ax.plot(lams, [r["recon_visual_stage2"] for r in records_main], "--s", color="#2ca02c", label="Visual · stage2")
     ax.set_xscale("log")
     ax.set_xlabel("λ_base")
-    ax.set_ylabel("centered recon cosine")
-    ax.set_title("recon vs λ   (centered space, paper §3.2.4 def)", fontsize=11)
+    ax.set_ylabel("recon cos(ẑ, z) — SpLiCE Eq.(2)")
+    ax.set_title("recon vs λ   (Step-4 ẑ = σ(σ(C̃·w) + μ_z), uncentered)", fontsize=11)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8.5)
 

@@ -110,5 +110,24 @@ def step4_reconstruct(
     c_center: np.ndarray,
     z_mean: np.ndarray,
 ) -> np.ndarray:
+    """SpLiCE Step-4 reconstructed embedding ẑ = σ(σ(C̃·w) + μ_z).
+
+    Matches splice/model.py:106-110 (inner + outer normalize) and
+    AVVP/splice_retrieval IMPLEMENTATION.md §2.3.
+    """
     recon_center = l2_np(weights @ c_center, axis=1)
     return l2_np(recon_center + z_mean[None, :], axis=1)
+
+
+def step4_reconstruction_cosine(
+    weights: np.ndarray,
+    z_n: np.ndarray,
+    c_center: np.ndarray,
+    z_mean: np.ndarray,
+) -> np.ndarray:
+    """SpLiCE recon quality cos(ẑ, z_n) where ẑ = σ(σ(C̃·w) + μ_z).
+
+    z_n: L2-normalized original embedding (centering 전 L2-norm).
+    """
+    recon = step4_reconstruct(weights, c_center, z_mean)
+    return rowwise_cosine(recon, z_n)
