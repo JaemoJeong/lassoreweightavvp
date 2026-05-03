@@ -17,13 +17,14 @@ from .solver import (
 class Stage12Config:
     lambda_a: float
     lambda_v: float
-    lambda_video_a: float
-    lambda_video_v: float
-    beta: float
-    gamma: float
-    lambda_min_factor: float
+    kappa: float
+    eta: float
+    rho_min: float
+    rho_max: float
     fista_iters: int
     device: str
+    max_stage: int = 2
+    prior_mode: str = "full"
 
 
 @dataclass
@@ -109,7 +110,12 @@ def run_segment_decomposition(modality: PreparedModality, lam: float, iters: int
     recon_flat = step4_reconstruction_cosine(
         weights_flat, z_n_flat, modality.proto_center, modality.segment_mean
     )
-    return _segment_stats(weights_flat, recon_flat, modality.num_videos, modality.num_segments)
+    recon_center_flat = centered_reconstruction_cosine(
+        weights_flat, modality.segment_center, modality.proto_center
+    )
+    out = _segment_stats(weights_flat, recon_flat, modality.num_videos, modality.num_segments)
+    out["recon_center"] = recon_center_flat.reshape(modality.num_videos, modality.num_segments)
+    return out
 
 
 def run_video_decomposition(modality: PreparedModality, lam: float, iters: int, device: str) -> dict[str, np.ndarray]:
@@ -135,28 +141,56 @@ def compute_presence(stage1_weights: np.ndarray) -> np.ndarray:
     return stage1_weights.max(axis=1).astype(np.float32)
 
 
-def compute_active_rejection(video_weights: np.ndarray) -> np.ndarray:
-    top = video_weights.max(axis=1, keepdims=True)
-    return np.maximum(0.0, top - video_weights).astype(np.float32)
+def compute_sparse_confidence(stage1_weights: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    top = stage1_weights.max(axis=2, keepdims=True)
+    return (stage1_weights / (top + eps)).astype(np.float32)
 
 
-def build_weighted_penalty(
-    source_presence: np.ndarray,
-    source_absence: np.ndarray,
+def compute_local_support(
+    stage1_weights: np.ndarray,
+    recon_center: np.ndarray,
+    eps: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sparse_confidence = compute_sparse_confidence(stage1_weights, eps=eps)
+    # r_m(t) is a reconstruction reliability signal, so negative centered
+    # reconstruction cosine should not become a negative prior.
+    reliability = np.clip(recon_center, 0.0, 1.0).astype(np.float32)
+    local_support = (sparse_confidence * reliability[:, :, None]).astype(np.float32)
+    return sparse_confidence, reliability, local_support
+
+
+def compute_video_plausibility(local_support: np.ndarray) -> np.ndarray:
+    return local_support.max(axis=1).astype(np.float32)
+
+
+def build_cross_modal_prior(
+    source_local_support: np.ndarray,
+    source_plausibility: np.ndarray,
+    kappa: float,
+    prior_mode: str = "full",
+) -> np.ndarray:
+    video_prior = source_plausibility[:, None, :]
+    if prior_mode == "video":
+        return np.broadcast_to(video_prior, source_local_support.shape).astype(np.float32)
+    if prior_mode != "full":
+        raise ValueError(f"unknown prior_mode={prior_mode!r}; expected 'full' or 'video'")
+    return (video_prior * (1.0 + float(kappa) * source_local_support)).astype(np.float32)
+
+
+def build_prior_weighted_penalty(
+    cross_modal_prior: np.ndarray,
     base_lambda: float,
-    beta: float,
-    gamma: float,
-    lambda_min_factor: float,
-    num_segments: int,
+    eta: float,
+    rho_min: float,
+    rho_max: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    evidence = beta * source_presence[:, None, :] - gamma * source_absence[:, None, :]
-    evidence = np.broadcast_to(
-        evidence,
-        (source_presence.shape[0], num_segments, source_presence.shape[1]),
+    penalty_scale = np.clip(
+        np.exp(-float(eta) * cross_modal_prior),
+        float(rho_min),
+        float(rho_max),
     ).astype(np.float32)
-    penalty_scale = np.maximum(lambda_min_factor, 1.0 - evidence).astype(np.float32)
-    penalty = (base_lambda * penalty_scale).reshape(-1, source_presence.shape[1]).astype(np.float32)
-    return evidence.astype(np.float32), penalty
+    penalty = (float(base_lambda) * penalty_scale).reshape(-1, cross_modal_prior.shape[2])
+    return penalty_scale.astype(np.float32), penalty.astype(np.float32)
 
 
 def run_weighted_segment_decomposition(
@@ -188,9 +222,25 @@ def summarize_results(results: dict[str, np.ndarray]) -> dict[str, float]:
     }
 
 
+def summarize_prior(prior: np.ndarray, penalty_scale: np.ndarray) -> dict[str, float]:
+    return {
+        "prior_mean": float(prior.mean()),
+        "prior_std": float(prior.std()),
+        "prior_max": float(prior.max()),
+        "penalty_scale_mean": float(penalty_scale.mean()),
+        "penalty_scale_std": float(penalty_scale.std()),
+        "penalty_scale_min": float(penalty_scale.min()),
+        "penalty_scale_max": float(penalty_scale.max()),
+    }
+
+
 def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12Config) -> dict[str, object]:
     if audio.num_videos != visual.num_videos or audio.num_segments != visual.num_segments:
         raise ValueError("audio/visual sample layout mismatch")
+    if cfg.max_stage not in (1, 2):
+        raise ValueError(f"max_stage must be 1 or 2, got {cfg.max_stage}")
+    if cfg.prior_mode not in ("full", "video"):
+        raise ValueError(f"prior_mode must be 'full' or 'video', got {cfg.prior_mode!r}")
 
     audio_stage1 = run_segment_decomposition(audio, cfg.lambda_a, cfg.fista_iters, cfg.device)
     visual_stage1 = run_segment_decomposition(visual, cfg.lambda_v, cfg.fista_iters, cfg.device)
@@ -198,58 +248,89 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
     presence_a = compute_presence(audio_stage1["weights"])
     presence_v = compute_presence(visual_stage1["weights"])
 
-    audio_video = run_video_decomposition(audio, cfg.lambda_video_a, cfg.fista_iters, cfg.device)
-    visual_video = run_video_decomposition(visual, cfg.lambda_video_v, cfg.fista_iters, cfg.device)
+    results: dict[str, object] = {
+        "config": asdict(cfg),
+        "audio": {
+            "stage1": audio_stage1,
+            "presence": presence_a,
+            "summary_stage1": summarize_results(audio_stage1),
+        },
+        "visual": {
+            "stage1": visual_stage1,
+            "presence": presence_v,
+            "summary_stage1": summarize_results(visual_stage1),
+        },
+    }
 
-    absence_a = compute_active_rejection(audio_video["weights"])
-    absence_v = compute_active_rejection(visual_video["weights"])
+    if cfg.max_stage == 1:
+        return results
 
-    evidence_v_to_a, penalty_a = build_weighted_penalty(
-        source_presence=presence_v,
-        source_absence=absence_v,
-        base_lambda=cfg.lambda_a,
-        beta=cfg.beta,
-        gamma=cfg.gamma,
-        lambda_min_factor=cfg.lambda_min_factor,
-        num_segments=audio.num_segments,
+    sparse_conf_a, reliability_a, local_support_a = compute_local_support(
+        audio_stage1["weights"],
+        audio_stage1["recon_center"],
     )
-    evidence_a_to_v, penalty_v = build_weighted_penalty(
-        source_presence=presence_a,
-        source_absence=absence_a,
+    sparse_conf_v, reliability_v, local_support_v = compute_local_support(
+        visual_stage1["weights"],
+        visual_stage1["recon_center"],
+    )
+    plausibility_a = compute_video_plausibility(local_support_a)
+    plausibility_v = compute_video_plausibility(local_support_v)
+
+    prior_v_to_a = build_cross_modal_prior(
+        source_local_support=local_support_v,
+        source_plausibility=plausibility_v,
+        kappa=cfg.kappa,
+        prior_mode=cfg.prior_mode,
+    )
+    prior_a_to_v = build_cross_modal_prior(
+        source_local_support=local_support_a,
+        source_plausibility=plausibility_a,
+        kappa=cfg.kappa,
+        prior_mode=cfg.prior_mode,
+    )
+
+    penalty_scale_a, penalty_a = build_prior_weighted_penalty(
+        cross_modal_prior=prior_v_to_a,
+        base_lambda=cfg.lambda_a,
+        eta=cfg.eta,
+        rho_min=cfg.rho_min,
+        rho_max=cfg.rho_max,
+    )
+    penalty_scale_v, penalty_v = build_prior_weighted_penalty(
+        cross_modal_prior=prior_a_to_v,
         base_lambda=cfg.lambda_v,
-        beta=cfg.beta,
-        gamma=cfg.gamma,
-        lambda_min_factor=cfg.lambda_min_factor,
-        num_segments=visual.num_segments,
+        eta=cfg.eta,
+        rho_min=cfg.rho_min,
+        rho_max=cfg.rho_max,
     )
 
     audio_stage2 = run_weighted_segment_decomposition(audio, penalty_a, cfg.fista_iters, cfg.device)
     visual_stage2 = run_weighted_segment_decomposition(visual, penalty_v, cfg.fista_iters, cfg.device)
 
-    return {
-        "config": asdict(cfg),
-        "audio": {
-            "stage1": audio_stage1,
-            "video": audio_video,
-            "presence": presence_a,
-            "absence": absence_a,
-            "evidence_from_visual": evidence_v_to_a,
-            "weighted_lambda": penalty_a.reshape(audio.num_videos, audio.num_segments, audio.num_classes),
-            "stage2": audio_stage2,
-            "summary_stage1": summarize_results(audio_stage1),
-            "summary_stage2": summarize_results(audio_stage2),
-            "summary_video": summarize_results(audio_video),
-        },
-        "visual": {
-            "stage1": visual_stage1,
-            "video": visual_video,
-            "presence": presence_v,
-            "absence": absence_v,
-            "evidence_from_audio": evidence_a_to_v,
-            "weighted_lambda": penalty_v.reshape(visual.num_videos, visual.num_segments, visual.num_classes),
-            "stage2": visual_stage2,
-            "summary_stage1": summarize_results(visual_stage1),
-            "summary_stage2": summarize_results(visual_stage2),
-            "summary_video": summarize_results(visual_video),
-        },
-    }
+    results["audio"].update({
+        "sparse_confidence": sparse_conf_a,
+        "reliability": reliability_a,
+        "local_support": local_support_a,
+        "plausibility": plausibility_a,
+        "prior_from_visual": prior_v_to_a,
+        "penalty_scale": penalty_scale_a,
+        "evidence_from_visual": prior_v_to_a,
+        "weighted_lambda": penalty_a.reshape(audio.num_videos, audio.num_segments, audio.num_classes),
+        "stage2": audio_stage2,
+        "summary_stage2": summarize_results(audio_stage2),
+        "summary_prior": summarize_prior(prior_v_to_a, penalty_scale_a),
+    })
+    results["visual"].update({
+        "sparse_confidence": sparse_conf_v,
+        "reliability": reliability_v,
+        "local_support": local_support_v,
+        "plausibility": plausibility_v,
+        "prior_from_audio": prior_a_to_v,
+        "penalty_scale": penalty_scale_v,
+        "evidence_from_audio": prior_a_to_v,
+        "weighted_lambda": penalty_v.reshape(visual.num_videos, visual.num_segments, visual.num_classes),
+        "stage2": visual_stage2,
+        "summary_stage2": summarize_results(visual_stage2),
+        "summary_prior": summarize_prior(prior_a_to_v, penalty_scale_v),
+    })
+    return results
