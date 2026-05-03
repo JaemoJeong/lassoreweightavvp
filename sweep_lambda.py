@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT))
 from avvp_stage12.baselines import compute_zero_shot_baseline
 from avvp_stage12.data import build_dense_gt, load_llp_metadata
 from avvp_stage12.metrics import (
+    apply_min_duration_filter,
     norm_similarities_np,
     avvp_segment_f1,
     score_sparse_weights,
@@ -69,7 +70,10 @@ def lam_tag(lam: float) -> str:
 def run_one(out_dir: Path, lam: float, kappa: float, eta: float,
             rho_min: float, rho_max: float, fista_iters: int, device: str,
             mean_source: str, audio_mean_path: str | None, visual_mean_path: str | None,
-            limit_videos: int, score_include_zero: bool, stage2_prior_mode: str, dry_run: bool) -> None:
+            limit_videos: int, score_include_zero: bool, stage2_prior_mode: str,
+            video_prior_no_reliability: bool,
+            stage2_active_set: str, stage2_active_eps: float,
+            stage2_inactive_penalty: float, pred_min_duration: int, dry_run: bool) -> None:
     cmd = [
         PYBIN, str(RUNNER),
         "--out-dir", str(out_dir),
@@ -79,11 +83,19 @@ def run_one(out_dir: Path, lam: float, kappa: float, eta: float,
         "--rho-min", str(rho_min),
         "--rho-max", str(rho_max),
         "--stage2-prior-mode", stage2_prior_mode,
+        "--stage2-active-set", stage2_active_set,
+        "--stage2-active-eps", str(stage2_active_eps),
+        "--stage2-inactive-penalty", str(stage2_inactive_penalty),
+        "--pred-min-duration", str(pred_min_duration),
         "--fista-iters", str(fista_iters),
         "--device", device,
         "--mean-source", mean_source,
         "--no-details",
     ]
+    if video_prior_no_reliability:
+        cmd += ["--video-prior-no-reliability"]
+    else:
+        cmd += ["--video-prior-use-reliability"]
     if score_include_zero:
         cmd += ["--score-include-zero"]
     if audio_mean_path:
@@ -103,7 +115,12 @@ def run_one(out_dir: Path, lam: float, kappa: float, eta: float,
         raise RuntimeError(f"run failed for {out_dir} (see {log_file})")
 
 
-def fixed_threshold_pred(weights: np.ndarray, thr: float = THR, exclude_zero: bool = True) -> np.ndarray:
+def fixed_threshold_pred(
+    weights: np.ndarray,
+    thr: float = THR,
+    exclude_zero: bool = True,
+    pred_min_duration: int = 1,
+) -> np.ndarray:
     """W: (n, 10, K) → binary pred (n, 10, K) via v5.2 adaptive_k scorer."""
     _, pred, _, _ = score_sparse_weights(
         weights,
@@ -113,17 +130,31 @@ def fixed_threshold_pred(weights: np.ndarray, thr: float = THR, exclude_zero: bo
         t_max=SCORE_T_MAX,
         exclude_zero=exclude_zero,
     )
-    return pred
+    return apply_min_duration_filter(pred, pred_min_duration)
 
 
-def f1_from_W(W: np.ndarray, GT: np.ndarray, exclude_zero: bool = True) -> float:
+def f1_from_W(
+    W: np.ndarray,
+    GT: np.ndarray,
+    exclude_zero: bool = True,
+    pred_min_duration: int = 1,
+) -> float:
     """Flatten (n, 10, K) → (n*10, K) for avvp_segment_f1 (per-row macro-style)."""
-    pred = fixed_threshold_pred(W, exclude_zero=exclude_zero).reshape(-1, W.shape[-1])
+    pred = fixed_threshold_pred(
+        W,
+        exclude_zero=exclude_zero,
+        pred_min_duration=pred_min_duration,
+    ).reshape(-1, W.shape[-1])
     gt = GT.reshape(-1, GT.shape[-1])
     return avvp_segment_f1(pred, gt)
 
 
-def evaluate_run(out_dir: Path, filenames: list[str], score_exclude_zero: bool) -> dict[str, float]:
+def evaluate_run(
+    out_dir: Path,
+    filenames: list[str],
+    score_exclude_zero: bool,
+    pred_min_duration: int,
+) -> dict[str, float]:
     """Load saved npy + GT, compute fixed-thr F1 + read recon/L0 from meta."""
     meta = json.loads((out_dir / "meta.json").read_text())
     Wa1 = np.load(out_dir / "W_a_stage1.npy")
@@ -139,10 +170,10 @@ def evaluate_run(out_dir: Path, filenames: list[str], score_exclude_zero: bool) 
         GT_A = build_dense_gt(kept, "audio")
         GT_V = build_dense_gt(kept, "visual")
 
-    f1_a1 = f1_from_W(Wa1, GT_A, exclude_zero=score_exclude_zero)
-    f1_a2 = f1_from_W(Wa2, GT_A, exclude_zero=score_exclude_zero)
-    f1_v1 = f1_from_W(Wv1, GT_V, exclude_zero=score_exclude_zero)
-    f1_v2 = f1_from_W(Wv2, GT_V, exclude_zero=score_exclude_zero)
+    f1_a1 = f1_from_W(Wa1, GT_A, exclude_zero=score_exclude_zero, pred_min_duration=pred_min_duration)
+    f1_a2 = f1_from_W(Wa2, GT_A, exclude_zero=score_exclude_zero, pred_min_duration=pred_min_duration)
+    f1_v1 = f1_from_W(Wv1, GT_V, exclude_zero=score_exclude_zero, pred_min_duration=pred_min_duration)
+    f1_v2 = f1_from_W(Wv2, GT_V, exclude_zero=score_exclude_zero, pred_min_duration=pred_min_duration)
 
     # Sanity diagnostics: stage1 vs stage2 W max-abs diff (only meaningful at η=0)
     diff_a = float(np.max(np.abs(Wa2 - Wa1)))
@@ -164,6 +195,7 @@ def evaluate_run(out_dir: Path, filenames: list[str], score_exclude_zero: bool) 
         "max_abs_W_diff_audio": diff_a,
         "max_abs_W_diff_visual": diff_v,
         "score_exclude_zero": bool(score_exclude_zero),
+        "pred_min_duration": int(pred_min_duration),
     }
 
 
@@ -276,7 +308,10 @@ def make_plots(
     ax.set_ylabel(f"AVVP segment F1 (fixed thr={THR})")
     ax.set_title(
         f"F1 vs λ   (κ={records_main[0]['kappa']:.2f}, η={records_main[0]['eta']:.2f}, "
-        f"prior={records_main[0].get('stage2_prior_mode', 'full')}, fixed thr {THR})",
+        f"prior={records_main[0].get('stage2_prior_mode', 'full')}, "
+        f"{'no-q' if records_main[0].get('video_prior_no_reliability', False) else 'with-q'}, "
+        f"active={records_main[0].get('stage2_active_set', 'all')}, "
+        f"min-dur={records_main[0].get('pred_min_duration', 1)}, fixed thr {THR})",
         fontsize=11,
     )
     ax.grid(alpha=0.3)
@@ -309,10 +344,13 @@ def make_plots(
     ax.legend(fontsize=8.5)
 
     zero_label = "zero-excluded score" if records_main[0].get("score_exclude_zero", True) else "zero-included score"
+    duration_label = f"min-dur={records_main[0].get('pred_min_duration', 1)}"
+    q_label = "no-q" if records_main[0].get("video_prior_no_reliability", False) else "with-q"
     title = (
         f"stage1/2 λ sweep · LLP test "
         f"({records_main[0]['mean_source_label']}, {zero_label}, "
-        f"prior={records_main[0].get('stage2_prior_mode', 'full')})"
+        f"prior={records_main[0].get('stage2_prior_mode', 'full')}, "
+        f"{q_label}, active={records_main[0].get('stage2_active_set', 'all')}, {duration_label})"
     )
     if av2a_baseline is not None:
         title += f"\nAV2A baseline: {Path(str(av2a_baseline['path'])).parent.name}"
@@ -342,8 +380,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-root", type=Path, default=ROOT / "results" / "sweep_lambda")
     ap.add_argument("--lambdas", type=float, nargs="+",
-                    default=[0.005, 0.01, 0.02, 0.05, 0.1, 0.2])
-    ap.add_argument("--kappa", type=float, default=1.0)
+                    default=[0.005, 0.01, 0.02, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 0.75])
+    ap.add_argument("--kappa", type=float, default=4.0)
     ap.add_argument("--eta", type=float, default=1.0)
     ap.add_argument("--rho-min", type=float, default=0.1)
     ap.add_argument("--rho-max", type=float, default=1.0)
@@ -353,10 +391,37 @@ def main() -> None:
         default="full",
         help="'full': video-level prior * segment prior; 'video': video-level prior only",
     )
+    ap.add_argument(
+        "--video-prior-no-reliability",
+        dest="video_prior_no_reliability",
+        action="store_true",
+        default=True,
+        help="forward --video-prior-no-reliability to run_llp_stage12.py",
+    )
+    ap.add_argument(
+        "--video-prior-use-reliability",
+        dest="video_prior_no_reliability",
+        action="store_false",
+        help="forward --video-prior-use-reliability to run_llp_stage12.py",
+    )
+    ap.add_argument(
+        "--stage2-active-set",
+        choices=["all", "stage1"],
+        default="all",
+        help="'all': weighted rerun may select any class; 'stage1': rerun only over target stage1 active labels",
+    )
+    ap.add_argument(
+        "--exclude-stage1-sparse",
+        action="store_true",
+        help="shortcut for --stage2-active-set stage1",
+    )
+    ap.add_argument("--stage2-active-eps", type=float, default=1e-6)
+    ap.add_argument("--stage2-inactive-penalty", type=float, default=1e6)
+    ap.add_argument("--pred-min-duration", type=int, default=2)
     ap.add_argument("--fista-iters", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit-videos", type=int, default=0)
-    ap.add_argument("--mean-source", choices=["llp", "external"], default="llp")
+    ap.add_argument("--mean-source", choices=["llp", "external"], default="external")
     ap.add_argument("--audio-mean-path", type=str, default=None)
     ap.add_argument("--visual-mean-path", type=str, default=None)
     ap.add_argument("--av2a-metrics-path", type=str, default=str(DEFAULT_AV2A_METRICS_PATH))
@@ -378,6 +443,7 @@ def main() -> None:
     args.out_root.mkdir(parents=True, exist_ok=True)
     write_mean_meta(args.out_root, args.mean_source, args.audio_mean_path, args.visual_mean_path)
     score_exclude_zero = not args.score_include_zero
+    stage2_active_set = "stage1" if args.exclude_stage1_sparse else args.stage2_active_set
 
     # ---------- 1. run all configs ----------
     main_dirs = []
@@ -388,14 +454,20 @@ def main() -> None:
             run_one(d, lam, args.kappa, args.eta, args.rho_min, args.rho_max,
                     args.fista_iters, args.device, args.mean_source,
                     args.audio_mean_path, args.visual_mean_path,
-                    args.limit_videos, args.score_include_zero, args.stage2_prior_mode, args.dry_run)
+                    args.limit_videos, args.score_include_zero, args.stage2_prior_mode,
+                    args.video_prior_no_reliability,
+                    stage2_active_set, args.stage2_active_eps,
+                    args.stage2_inactive_penalty, args.pred_min_duration, args.dry_run)
 
     sanity_dir = args.out_root / f"sanity_eta0_{lam_tag(args.sanity_lambda)}"
     if not args.skip_run:
         run_one(sanity_dir, args.sanity_lambda, args.kappa, 0.0, args.rho_min, args.rho_max,
                 args.fista_iters, args.device, args.mean_source,
                 args.audio_mean_path, args.visual_mean_path,
-                args.limit_videos, args.score_include_zero, args.stage2_prior_mode, args.dry_run)
+                args.limit_videos, args.score_include_zero, args.stage2_prior_mode,
+                args.video_prior_no_reliability,
+                stage2_active_set, args.stage2_active_eps,
+                args.stage2_inactive_penalty, args.pred_min_duration, args.dry_run)
 
     if args.dry_run:
         print("[dry-run] done; no eval / no plot.")
@@ -408,7 +480,12 @@ def main() -> None:
 
     records = []
     for lam, d in main_dirs:
-        ev = evaluate_run(d, filenames, score_exclude_zero=score_exclude_zero)
+        ev = evaluate_run(
+            d,
+            filenames,
+            score_exclude_zero=score_exclude_zero,
+            pred_min_duration=args.pred_min_duration,
+        )
         ev.update({
             "lambda": lam,
             "kappa": args.kappa,
@@ -416,6 +493,11 @@ def main() -> None:
             "rho_min": args.rho_min,
             "rho_max": args.rho_max,
             "stage2_prior_mode": args.stage2_prior_mode,
+            "video_prior_no_reliability": bool(args.video_prior_no_reliability),
+            "stage2_active_set": stage2_active_set,
+            "stage2_active_eps": args.stage2_active_eps,
+            "stage2_inactive_penalty": args.stage2_inactive_penalty,
+            "pred_min_duration": args.pred_min_duration,
             "is_main": True,
             "out_dir": str(d),
             "mean_source": args.mean_source,
@@ -429,10 +511,20 @@ def main() -> None:
 
     sanity_ev = None
     if (sanity_dir / "meta.json").exists():
-        sanity_ev = evaluate_run(sanity_dir, filenames, score_exclude_zero=score_exclude_zero)
+        sanity_ev = evaluate_run(
+            sanity_dir,
+            filenames,
+            score_exclude_zero=score_exclude_zero,
+            pred_min_duration=args.pred_min_duration,
+        )
         sanity_ev.update({"lambda": args.sanity_lambda, "kappa": args.kappa, "eta": 0.0,
                            "rho_min": args.rho_min, "rho_max": args.rho_max,
                            "stage2_prior_mode": args.stage2_prior_mode,
+                           "video_prior_no_reliability": bool(args.video_prior_no_reliability),
+                           "stage2_active_set": stage2_active_set,
+                           "stage2_active_eps": args.stage2_active_eps,
+                           "stage2_inactive_penalty": args.stage2_inactive_penalty,
+                           "pred_min_duration": args.pred_min_duration,
                            "is_main": False, "out_dir": str(sanity_dir),
                            "mean_source": args.mean_source,
                            "mean_source_label": label})

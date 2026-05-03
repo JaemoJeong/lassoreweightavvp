@@ -6,7 +6,13 @@ from pathlib import Path
 import numpy as np
 
 from .constants import LLP_CATS
-from .metrics import avvp_official_metrics, avvp_segment_f1, score_sparse_weights, sparse_weight_scores
+from .metrics import (
+    apply_min_duration_filter,
+    avvp_official_metrics,
+    avvp_segment_f1,
+    score_sparse_weights,
+    sparse_weight_scores,
+)
 
 
 def _binary_f1_per_class(pred: np.ndarray, gt: np.ndarray) -> list[dict[str, float | int | str]]:
@@ -72,6 +78,7 @@ def compute_stage_predictions(
     score_k0: float = 16.0,
     score_t_min: float = 0.25,
     score_t_max: float = 1.25,
+    pred_min_duration: int = 1,
 ) -> dict[str, np.ndarray]:
     if score_mode == "adaptive_k":
         scores_a, pred_a, K_a, T_a = score_sparse_weights(
@@ -97,6 +104,8 @@ def compute_stage_predictions(
         pred_v = (scores_v > threshold).astype(np.uint8)
     else:
         raise ValueError(f"unknown score_mode={score_mode!r}")
+    pred_a = apply_min_duration_filter(pred_a, pred_min_duration)
+    pred_v = apply_min_duration_filter(pred_v, pred_min_duration)
     pred_av = (pred_a & pred_v).astype(np.uint8)
     return {
         "scores_a": scores_a.astype(np.float32),
@@ -122,6 +131,7 @@ def compute_stage_metrics(
     score_k0: float,
     score_t_min: float,
     score_t_max: float,
+    pred_min_duration: int,
 ) -> dict[str, object]:
     gt_av = (gt_a & gt_v).astype(np.uint8)
     pred_a = pred["pred_a"]
@@ -140,6 +150,7 @@ def compute_stage_metrics(
         "score_k0": float(score_k0),
         "score_t_min": float(score_t_min),
         "score_t_max": float(score_t_max),
+        "pred_min_duration": int(pred_min_duration),
         "audio_segment_f1": avvp_segment_f1(pred_a.reshape(-1, pred_a.shape[-1]), gt_a.reshape(-1, gt_a.shape[-1])),
         "visual_segment_f1": avvp_segment_f1(pred_v.reshape(-1, pred_v.shape[-1]), gt_v.reshape(-1, gt_v.shape[-1])),
         "av_segment_f1_and": avvp_segment_f1(pred_av.reshape(-1, pred_av.shape[-1]), gt_av.reshape(-1, gt_av.shape[-1])),
@@ -199,6 +210,7 @@ def write_segment_details(
     score_k0: float,
     score_t_min: float,
     score_t_max: float,
+    pred_min_duration: int,
     max_videos: int,
     top_k: int,
     all_classes: bool,
@@ -228,6 +240,7 @@ def write_segment_details(
         f"Score mode: {score_mode}; K0={score_k0:.3f}; Tmin={score_t_min:.3f}; Tmax={score_t_max:.3f}.",
         f"Zero weights excluded from z-score stats: {score_exclude_zero}.",
         f"Threshold: {threshold:.3f}. Pred_AV uses Pred_A AND Pred_V.",
+        f"Post-hoc min-duration filter: {pred_min_duration} segment(s) per video/class.",
         "Rows show GT/pred-active classes plus top-k classes by audio/visual score.",
         "Stage2 extra columns, when present: A_* means prior/signal used for audio reweighting; V_* means prior/signal used for visual reweighting.",
         sep,
@@ -348,6 +361,7 @@ def write_stage_eval_outputs(
     score_k0: float = 16.0,
     score_t_min: float = 0.25,
     score_t_max: float = 1.25,
+    pred_min_duration: int = 1,
 ) -> dict[str, object]:
     pred = compute_stage_predictions(
         W_a,
@@ -358,6 +372,7 @@ def write_stage_eval_outputs(
         score_k0=score_k0,
         score_t_min=score_t_min,
         score_t_max=score_t_max,
+        pred_min_duration=pred_min_duration,
     )
     metrics = compute_stage_metrics(
         stage_name,
@@ -370,6 +385,7 @@ def write_stage_eval_outputs(
         score_k0=score_k0,
         score_t_min=score_t_min,
         score_t_max=score_t_max,
+        pred_min_duration=pred_min_duration,
     )
     (out_dir / f"metrics_{stage_name}.json").write_text(
         json.dumps(metrics, indent=2, ensure_ascii=False)
@@ -406,6 +422,7 @@ def write_stage_eval_outputs(
             score_k0=score_k0,
             score_t_min=score_t_min,
             score_t_max=score_t_max,
+            pred_min_duration=pred_min_duration,
             max_videos=detail_max_videos,
             top_k=detail_top_k,
             all_classes=detail_all_classes,

@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from avvp_stage12.baselines import compute_zero_shot_baseline, load_av2a_baseline  # noqa: E402
 from avvp_stage12.data import build_dense_gt  # noqa: E402
 from avvp_stage12.metrics import (  # noqa: E402
+    apply_min_duration_filter,
     avvp_official_metrics,
     avvp_official_segment_level,
     avvp_segment_f1,
@@ -88,19 +89,20 @@ def f1_metrics(
     gt_v: np.ndarray,
     tau: float,
     include_event: bool = True,
+    pred_min_duration: int = 2,
 ) -> dict[str, float | str]:
-    pred_a = (scores_a > tau).astype(np.uint8).reshape(-1, scores_a.shape[-1])
-    pred_v = (scores_v > tau).astype(np.uint8).reshape(-1, scores_v.shape[-1])
-    pred_av = pred_a & pred_v
+    pred_a_3d = apply_min_duration_filter((scores_a > tau).astype(np.uint8), pred_min_duration)
+    pred_v_3d = apply_min_duration_filter((scores_v > tau).astype(np.uint8), pred_min_duration)
+    pred_av_3d = pred_a_3d & pred_v_3d
+    pred_a = pred_a_3d.reshape(-1, scores_a.shape[-1])
+    pred_v = pred_v_3d.reshape(-1, scores_v.shape[-1])
+    pred_av = pred_av_3d.reshape(-1, scores_a.shape[-1])
     gt_a_flat = gt_a.reshape(-1, gt_a.shape[-1])
     gt_v_flat = gt_v.reshape(-1, gt_v.shape[-1])
     gt_av = gt_a_flat & gt_v_flat
     old_audio_f1 = avvp_segment_f1(pred_a, gt_a_flat)
     old_visual_f1 = avvp_segment_f1(pred_v, gt_v_flat)
     old_av_f1 = avvp_segment_f1(pred_av, gt_av)
-    pred_a_3d = pred_a.reshape(gt_a.shape)
-    pred_v_3d = pred_v.reshape(gt_v.shape)
-    pred_av_3d = pred_av.reshape(gt_a.shape)
     gt_av_3d = gt_av.reshape(gt_a.shape)
     if include_event:
         official = avvp_official_metrics(
@@ -140,6 +142,7 @@ def f1_metrics(
         "row_visual_segment_f1": old_visual_f1,
         "row_av_segment_f1": old_av_f1,
         "row_mean_f1": (old_audio_f1 + old_visual_f1 + old_av_f1) / 3.0,
+        "pred_min_duration": int(pred_min_duration),
         "audio_pred_active_mean": float(pred_a.sum(axis=1).mean()),
         "visual_pred_active_mean": float(pred_v.sum(axis=1).mean()),
         "av_pred_active_mean": float(pred_av.sum(axis=1).mean()),
@@ -160,6 +163,7 @@ def eval_weight_pair(
     t_min: float,
     t_max: float,
     thresholds: list[float],
+    pred_min_duration: int,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
 
@@ -169,7 +173,15 @@ def eval_weight_pair(
     fixed_scores_v, _, fixed_temp_v = sparse_weight_scores(
         weights_v, temperature=1.0, exclude_zero=True
     )
-    fixed = f1_metrics(fixed_scores_a, fixed_scores_v, gt_a, gt_v, tau, include_event=False)
+    fixed = f1_metrics(
+        fixed_scores_a,
+        fixed_scores_v,
+        gt_a,
+        gt_v,
+        tau,
+        include_event=False,
+        pred_min_duration=pred_min_duration,
+    )
     rows.append({
         **fixed,
         "score_protocol": "fixed_T1",
@@ -198,7 +210,15 @@ def eval_weight_pair(
         exclude_zero=True,
     )
     del K_a, K_v
-    adaptive = f1_metrics(adaptive_scores_a, adaptive_scores_v, gt_a, gt_v, tau, include_event=False)
+    adaptive = f1_metrics(
+        adaptive_scores_a,
+        adaptive_scores_v,
+        gt_a,
+        gt_v,
+        tau,
+        include_event=False,
+        pred_min_duration=pred_min_duration,
+    )
     rows.append({
         **adaptive,
         "score_protocol": "adaptive_K_over_K0",
@@ -219,6 +239,7 @@ def eval_weight_pair(
             gt_v,
             threshold,
             include_event=False,
+            pred_min_duration=pred_min_duration,
         )
         oracle_candidates.append({
             **candidate,
@@ -255,7 +276,11 @@ def _find_run_dir(sweep_dir: Path, lam: float) -> Path:
     raise FileNotFoundError(f"could not find lambda={lam} under {sweep_dir}")
 
 
-def fill_event_metrics_for_selected(rows: list[dict[str, object]], sweep_dirs: list[Path]) -> None:
+def fill_event_metrics_for_selected(
+    rows: list[dict[str, object]],
+    sweep_dirs: list[Path],
+    pred_min_duration: int,
+) -> None:
     sweep_map = {path.name: path for path in sweep_dirs}
     for row in rows:
         if row["stage"] == "baseline":
@@ -291,7 +316,15 @@ def fill_event_metrics_for_selected(rows: list[dict[str, object]], sweep_dirs: l
             )
         else:
             continue
-        full_metrics = f1_metrics(scores_a, scores_v, gt_a, gt_v, float(row["tau"]), include_event=True)
+        full_metrics = f1_metrics(
+            scores_a,
+            scores_v,
+            gt_a,
+            gt_v,
+            float(row["tau"]),
+            include_event=True,
+            pred_min_duration=pred_min_duration,
+        )
         for key, value in full_metrics.items():
             row[key] = value
 
@@ -304,6 +337,7 @@ def load_run_rows(
     t_min: float,
     t_max: float,
     thresholds: list[float],
+    pred_min_duration: int,
 ) -> list[dict[str, object]]:
     meta = json.loads((run_dir / "meta.json").read_text())
     lam = float(meta["config"]["lambda_a"])
@@ -330,6 +364,7 @@ def load_run_rows(
             t_min=t_min,
             t_max=t_max,
             thresholds=thresholds,
+            pred_min_duration=pred_min_duration,
         ):
             rows.append({
                 "method": f"{stage_label}, {row['score_protocol']}",
@@ -343,6 +378,7 @@ def load_run_rows(
                 "Tmin": row["Tmin"],
                 "Tmax": row["Tmax"],
                 "tau": row["tau"],
+                "pred_min_duration": row["pred_min_duration"],
                 "audio_segment_f1": row["audio_segment_f1"],
                 "audio_event_f1": row["audio_event_f1"],
                 "visual_segment_f1": row["visual_segment_f1"],
@@ -396,6 +432,7 @@ def baseline_rows(sweep_dirs: list[Path]) -> list[dict[str, object]]:
                 "Tmin": "",
                 "Tmax": "",
                 "tau": zs.get("threshold", 0.75),
+                "pred_min_duration": "",
                 "audio_segment_f1": audio,
                 "audio_event_f1": zs.get("audio_event_f1", zs.get("F_event_a", "")),
                 "visual_segment_f1": visual,
@@ -448,6 +485,7 @@ def baseline_rows(sweep_dirs: list[Path]) -> list[dict[str, object]]:
                 "Tmin": "",
                 "Tmax": "",
                 "tau": "",
+                "pred_min_duration": "",
                 "audio_segment_f1": audio,
                 "audio_event_f1": av2a.get("F_event_a", ""),
                 "visual_segment_f1": visual,
@@ -509,6 +547,7 @@ def main() -> None:
     parser.add_argument("--k0", type=float, default=16.0)
     parser.add_argument("--t-min", type=float, default=0.25)
     parser.add_argument("--t-max", type=float, default=1.25)
+    parser.add_argument("--pred-min-duration", type=int, default=2)
     parser.add_argument("--thresholds", default=DEFAULT_THRESHOLDS)
     args = parser.parse_args()
 
@@ -518,10 +557,21 @@ def main() -> None:
     for sweep_dir in sweep_dirs:
         for run_dir in sorted(sweep_dir.glob("lam*")):
             if (run_dir / "meta.json").exists():
-                rows.extend(load_run_rows(sweep_dir, run_dir, args.tau, args.k0, args.t_min, args.t_max, thresholds))
+                rows.extend(
+                    load_run_rows(
+                        sweep_dir,
+                        run_dir,
+                        args.tau,
+                        args.k0,
+                        args.t_min,
+                        args.t_max,
+                        thresholds,
+                        args.pred_min_duration,
+                    )
+                )
 
     best_rows = select_best_rows(rows)
-    fill_event_metrics_for_selected(best_rows, sweep_dirs)
+    fill_event_metrics_for_selected(best_rows, sweep_dirs, args.pred_min_duration)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     write_tsv(args.all_out, rows)
     write_tsv(args.out, best_rows)

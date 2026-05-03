@@ -12,9 +12,9 @@ EVAL_VISUAL_CSV = DATA_ROOT / "AVVP_eval_visual.csv"
 
 DEFAULT_BACKBONE = "ClipClap"
 DEFAULT_VOCAB = "v25"
-DEFAULT_MEAN_SOURCE = "llp"
+DEFAULT_MEAN_SOURCE = "external"
 DEFAULT_VISUAL_MEAN_FILE = "clip_ViT-L-14_image_mscoco_train_N118287.npy"
-DEFAULT_AUDIO_MEAN_FILE = "clap_HTSAT-tiny_audio_dcase2017train_N1632.npy"
+DEFAULT_AUDIO_MEAN_FILE = "clap_HTSAT-tiny_audio_esc50_N1600.npy"
 
 LLP_CATS = [
     "Speech",

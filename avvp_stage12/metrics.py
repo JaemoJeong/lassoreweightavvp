@@ -106,6 +106,17 @@ def score_sparse_weights(
     return probs, pred, active_count, temperature
 
 
+def apply_min_duration_filter(pred: np.ndarray, min_duration: int = 1) -> np.ndarray:
+    """Remove per-video class predictions active for fewer than min_duration segments."""
+    pred = np.asarray(pred, dtype=np.uint8)
+    if min_duration <= 1:
+        return pred.astype(np.uint8)
+    if pred.ndim != 3:
+        raise ValueError(f"min-duration filter expects (N,T,C) predictions, got {pred.shape}")
+    keep = pred.sum(axis=1, keepdims=True) >= int(min_duration)
+    return (pred & keep).astype(np.uint8)
+
+
 def norm_similarities_np(
     scores: np.ndarray,
     exclude_zero: bool = True,

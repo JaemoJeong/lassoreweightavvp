@@ -20,10 +20,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--backbone", default=DEFAULT_BACKBONE)
     parser.add_argument("--vocab", default=DEFAULT_VOCAB)
-    parser.add_argument("--lambda-base", type=float, default=0.05)
+    parser.add_argument("--lambda-base", type=float, default=0.3)
     parser.add_argument("--lambda-a", type=float, default=None)
     parser.add_argument("--lambda-v", type=float, default=None)
-    parser.add_argument("--kappa", type=float, default=1.0)
+    parser.add_argument("--kappa", type=float, default=4.0)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--rho-min", type=float, default=None)
     parser.add_argument("--rho-max", type=float, default=1.0)
@@ -48,6 +48,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="shortcut for --stage2-prior-mode video",
     )
+    parser.add_argument(
+        "--video-prior-no-reliability",
+        dest="video_prior_no_reliability",
+        action="store_true",
+        default=True,
+        help="drop reliability q from video-level prior: pi(c) = max_t s(t,c) only",
+    )
+    parser.add_argument(
+        "--video-prior-use-reliability",
+        dest="video_prior_no_reliability",
+        action="store_false",
+        help="restore v5 behavior: use q-weighted reliable confidence for video-level prior",
+    )
+    parser.add_argument(
+        "--stage2-active-set",
+        choices=["all", "stage1"],
+        default="all",
+        help="'all': weighted rerun may select any class; 'stage1': rerun only over target stage1 active labels",
+    )
+    parser.add_argument(
+        "--exclude-stage1-sparse",
+        action="store_true",
+        help="shortcut for --stage2-active-set stage1",
+    )
+    parser.add_argument(
+        "--stage2-active-eps",
+        type=float,
+        default=1e-6,
+        help="stage1 weights above this value are considered active for --stage2-active-set stage1",
+    )
+    parser.add_argument(
+        "--stage2-inactive-penalty",
+        type=float,
+        default=1e6,
+        help="penalty assigned to classes outside the stage1 active set during stage2 rerun",
+    )
     parser.add_argument("--mean-source", choices=["llp", "external"], default=DEFAULT_MEAN_SOURCE)
     parser.add_argument("--audio-mean-path", type=Path, default=None)
     parser.add_argument("--visual-mean-path", type=Path, default=None)
@@ -61,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-k0", type=float, default=16.0)
     parser.add_argument("--score-t-min", type=float, default=0.25)
     parser.add_argument("--score-t-max", type=float, default=1.25)
+    parser.add_argument(
+        "--pred-min-duration",
+        type=int,
+        default=2,
+        help="post-hoc per-video/class prediction filter; values < this active segment count are removed",
+    )
     parser.add_argument(
         "--score-include-zero",
         action="store_true",
@@ -143,6 +185,10 @@ def main() -> None:
         device=args.device,
         max_stage=int(args.max_stage),
         prior_mode="video" if args.video_prior_only else args.stage2_prior_mode,
+        video_prior_use_reliability=not args.video_prior_no_reliability,
+        stage2_active_set="stage1" if args.exclude_stage1_sparse else args.stage2_active_set,
+        stage2_active_eps=float(args.stage2_active_eps),
+        stage2_inactive_penalty=float(args.stage2_inactive_penalty),
     )
 
     results = run_stage12(audio, visual, cfg)
@@ -183,6 +229,8 @@ def main() -> None:
         np.save(args.out_dir / "H_a_to_v.npy", visual_results["prior_from_audio"])
         np.save(args.out_dir / "penalty_scale_a.npy", audio_results["penalty_scale"])
         np.save(args.out_dir / "penalty_scale_v.npy", visual_results["penalty_scale"])
+        np.save(args.out_dir / "stage2_active_mask_a.npy", audio_results["stage2_active_mask"])
+        np.save(args.out_dir / "stage2_active_mask_v.npy", visual_results["stage2_active_mask"])
         # Backward-compatible alias: evidence now means the v5 cross-modal prior H(t,c).
         np.save(args.out_dir / "evidence_v_to_a.npy", audio_results["evidence_from_visual"])
         np.save(args.out_dir / "evidence_a_to_v.npy", visual_results["evidence_from_audio"])
@@ -197,6 +245,11 @@ def main() -> None:
     gt_v = build_dense_gt(filenames, "visual")
     score_exclude_zero = not args.score_include_zero
     metrics = {
+        "protocol_version": (
+            "v6-main"
+            if args.video_prior_no_reliability and int(args.pred_min_duration) == 2
+            else "stage12"
+        ),
         "threshold": float(args.score_thr),
         "score_normalization": (
             "adaptive_k: active z-score over nonzero coefficients, "
@@ -207,6 +260,7 @@ def main() -> None:
         "score_k0": float(args.score_k0),
         "score_t_min": float(args.score_t_min),
         "score_t_max": float(args.score_t_max),
+        "pred_min_duration": int(args.pred_min_duration),
         "pred_av_rule": "Pred_AV = Pred_A AND Pred_V",
         "stages": {},
     }
@@ -229,6 +283,7 @@ def main() -> None:
         score_k0=float(args.score_k0),
         score_t_min=float(args.score_t_min),
         score_t_max=float(args.score_t_max),
+        pred_min_duration=int(args.pred_min_duration),
     )
     if "stage2" in audio_results:
         stage1_pred = compute_stage_predictions(
@@ -240,6 +295,7 @@ def main() -> None:
             score_k0=float(args.score_k0),
             score_t_min=float(args.score_t_min),
             score_t_max=float(args.score_t_max),
+            pred_min_duration=int(args.pred_min_duration),
         )
         stage1_scores_a = stage1_pred["scores_a"].astype(np.float32)
         stage1_scores_v = stage1_pred["scores_v"].astype(np.float32)
@@ -264,6 +320,7 @@ def main() -> None:
             score_k0=float(args.score_k0),
             score_t_min=float(args.score_t_min),
             score_t_max=float(args.score_t_max),
+            pred_min_duration=int(args.pred_min_duration),
             detail_extra_columns=[
                 ("A_S1Score", stage1_scores_a),
                 ("V_S1Score", stage1_scores_v),
@@ -316,18 +373,29 @@ def main() -> None:
             for stage, vals in metrics["stages"].items()
         },
         "notes": {
+            "protocol_version": (
+                "v6-main"
+                if args.video_prior_no_reliability and int(args.pred_min_duration) == 2
+                else "stage12"
+            ),
             "presence": "P[c] = max_t w_stage1[t, c]",
             "sparse_confidence": "s_m(t,c)=w_m(t,c)/(max_j w_m(t,j)+eps)",
             "reconstruction_quality": "q_m(t)=max(0, cos(z_tilde_m(t), normalize(C_tilde_m w_m(t))))",
             "reliable_confidence": "g_m(t,c)=s_m(t,c)*q_m(t)",
             "segment_prior": "h_m(t,c)=g_m(t,c)",
-            "video_prior": "pi_m(c)=max_t g_m(t,c)",
+            "video_prior": (
+                "v6 default: pi_m(c)=max_t s_m(t,c), dropping q at video level; "
+                "with --video-prior-use-reliability: pi_m(c)=max_t g_m(t,c)"
+            ),
             "legacy_names": "reliability=q, local_support/reliable_confidence=g, plausibility/video_prior=pi",
             "cross_modal_prior": (
                 "full: H_source_to_target(t,c)=pi_source(c)*(1+kappa*g_source(t,c)); "
                 "video: H_source_to_target(t,c)=pi_source(c)"
             ),
             "stage2_prior_mode": results["config"]["prior_mode"],
+            "stage2_active_set": results["config"]["stage2_active_set"],
+            "stage2_active_eps": results["config"]["stage2_active_eps"],
+            "stage2_inactive_penalty": results["config"]["stage2_inactive_penalty"],
             "weighted_lambda": "lambda_target^c(t)=lambda_base*clip(exp(-eta*H_source_to_target(t,c)), rho_min, rho_max)",
             "score": (
                 "adaptive_k: active z-score over nonzero coefficients, "
@@ -338,9 +406,13 @@ def main() -> None:
             "score_t_min": float(args.score_t_min),
             "score_t_max": float(args.score_t_max),
             "score_exclude_zero": bool(score_exclude_zero),
+            "pred_min_duration": int(args.pred_min_duration),
             "prediction_threshold": float(args.score_thr),
             "pred_av": "Pred_A AND Pred_V",
-            "stage2_scope": "AVVP_Paper_Draft_KR_v5 main formulation; no explicit absence term",
+            "stage2_scope": (
+                "AVVP_Paper_Draft_KR_v5 main formulation; no explicit absence term; "
+                "stage2_active_set=stage1 constrains the weighted rerun to labels active in target stage1"
+            ),
         },
     }
     (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2))

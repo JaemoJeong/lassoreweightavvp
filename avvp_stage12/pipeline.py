@@ -25,6 +25,10 @@ class Stage12Config:
     device: str
     max_stage: int = 2
     prior_mode: str = "full"
+    video_prior_use_reliability: bool = False
+    stage2_active_set: str = "all"
+    stage2_active_eps: float = 1e-6
+    stage2_inactive_penalty: float = 1e6
 
 
 @dataclass
@@ -229,6 +233,25 @@ def run_weighted_segment_decomposition(
     return _segment_stats(weights_flat, recon_flat, modality.num_videos, modality.num_segments)
 
 
+def apply_stage2_active_set_penalty(
+    penalty_flat: np.ndarray,
+    stage1_weights: np.ndarray,
+    active_set: str,
+    active_eps: float,
+    inactive_penalty: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if active_set == "all":
+        active_mask = np.ones_like(stage1_weights, dtype=bool)
+        return penalty_flat.astype(np.float32), active_mask
+    if active_set != "stage1":
+        raise ValueError(f"stage2_active_set must be 'all' or 'stage1', got {active_set!r}")
+
+    active_mask = stage1_weights > float(active_eps)
+    penalty = penalty_flat.reshape(stage1_weights.shape).copy()
+    penalty[~active_mask] = float(inactive_penalty)
+    return penalty.reshape(-1, stage1_weights.shape[2]).astype(np.float32), active_mask
+
+
 def summarize_results(results: dict[str, np.ndarray]) -> dict[str, float]:
     return {
         "recon_mean": float(results["recon"].mean()),
@@ -257,6 +280,10 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
         raise ValueError(f"max_stage must be 1 or 2, got {cfg.max_stage}")
     if cfg.prior_mode not in ("full", "video"):
         raise ValueError(f"prior_mode must be 'full' or 'video', got {cfg.prior_mode!r}")
+    if cfg.stage2_active_set not in ("all", "stage1"):
+        raise ValueError(
+            f"stage2_active_set must be 'all' or 'stage1', got {cfg.stage2_active_set!r}"
+        )
 
     audio_stage1 = run_segment_decomposition(audio, cfg.lambda_a, cfg.fista_iters, cfg.device)
     visual_stage1 = run_segment_decomposition(visual, cfg.lambda_v, cfg.fista_iters, cfg.device)
@@ -289,8 +316,13 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
         visual_stage1["weights"],
         visual_stage1["recon_center"],
     )
-    video_prior_a = compute_video_prior(reliable_conf_a)
-    video_prior_v = compute_video_prior(reliable_conf_v)
+    if cfg.video_prior_use_reliability:
+        video_prior_a = compute_video_prior(reliable_conf_a)
+        video_prior_v = compute_video_prior(reliable_conf_v)
+    else:
+        # Drop reliability q from video-level prior: π(c) = max_t s(t,c).
+        video_prior_a = compute_video_prior(sparse_conf_a)
+        video_prior_v = compute_video_prior(sparse_conf_v)
 
     prior_v_to_a = build_cross_modal_prior(
         source_segment_prior=reliable_conf_v,
@@ -319,6 +351,20 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
         rho_min=cfg.rho_min,
         rho_max=cfg.rho_max,
     )
+    penalty_a, active_mask_a = apply_stage2_active_set_penalty(
+        penalty_flat=penalty_a,
+        stage1_weights=audio_stage1["weights"],
+        active_set=cfg.stage2_active_set,
+        active_eps=cfg.stage2_active_eps,
+        inactive_penalty=cfg.stage2_inactive_penalty,
+    )
+    penalty_v, active_mask_v = apply_stage2_active_set_penalty(
+        penalty_flat=penalty_v,
+        stage1_weights=visual_stage1["weights"],
+        active_set=cfg.stage2_active_set,
+        active_eps=cfg.stage2_active_eps,
+        inactive_penalty=cfg.stage2_inactive_penalty,
+    )
 
     audio_stage2 = run_weighted_segment_decomposition(audio, penalty_a, cfg.fista_iters, cfg.device)
     visual_stage2 = run_weighted_segment_decomposition(visual, penalty_v, cfg.fista_iters, cfg.device)
@@ -334,6 +380,7 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
         "plausibility": video_prior_a,
         "prior_from_visual": prior_v_to_a,
         "penalty_scale": penalty_scale_a,
+        "stage2_active_mask": active_mask_a.astype(np.float32),
         "evidence_from_visual": prior_v_to_a,
         "weighted_lambda": penalty_a.reshape(audio.num_videos, audio.num_segments, audio.num_classes),
         "stage2": audio_stage2,
@@ -351,6 +398,7 @@ def run_stage12(audio: PreparedModality, visual: PreparedModality, cfg: Stage12C
         "plausibility": video_prior_v,
         "prior_from_audio": prior_a_to_v,
         "penalty_scale": penalty_scale_v,
+        "stage2_active_mask": active_mask_v.astype(np.float32),
         "evidence_from_audio": prior_a_to_v,
         "weighted_lambda": penalty_v.reshape(visual.num_videos, visual.num_segments, visual.num_classes),
         "stage2": visual_stage2,
